@@ -13,6 +13,8 @@
 #include <stack>
 #include <thread>
 #include <vector>
+#include <set>
+#include <map>
 
 
 namespace gch3 {
@@ -23,7 +25,7 @@ namespace gch3 {
     
     std::mutex mutex;
     std::condition_variable condition_variable;
-    
+        
     std::deque<Object*> worklist;
     bool worklist_request_roots = false;
     std::vector<Object*> infants;
@@ -34,48 +36,35 @@ namespace gch3 {
         BLACK,
     };
     
-    struct Object {
-        Color color;
-        Object* slots[SLOTS];
+    constexpr const char* ColorNames[3] = {
+        [WHITE] = "WHITE",
+        [GRAY] = "GRAY",
+        [BLACK] = "BLACK",
     };
     
-    bool isWhite(Object* ref) {
-        return ref->color == WHITE;
-    }
+    struct Object {
+        std::atomic<Color> color;
+        std::atomic<Object*> slots[SLOTS];
+    };
     
-    bool isGray(Object* ref) {
-        return ref->color == GRAY;
-    }
-    
-    bool isBlack(Object* ref) {
-        return ref->color == BLACK;
-    }
-
     Object* Read(Object* src, int i) {
-        // std::unique_lock lock(mutex);
         assert(src);
         assert(i < SLOTS);
-        return src->slots[i];
+        // The mutator thread is already ordered wrt the fields
+        return src->slots[i].load(std::memory_order_relaxed);
     }
         
-    // The mutator can turn a BLACK object back to GRAY only when it encounters
-    // a WHITE object, implying that some reachable objects are white and thus
-    // the tracing is incomplete
-    /*
-    void revert(Object* ref) {
-        assert(isBlack(ref));
-        ref->color = GRAY;
-        worklist.push_back(ref);
-    }
-     */
     
     // Steele
     void Write(Object* src, int i, Object* ref) {
-        std::unique_lock lock(mutex);
-        src->slots[i] = ref;
-        if (ref && isBlack(src) && isWhite(ref)) {
-            src->color = GRAY;
-            worklist.push_back(src);
+        src->slots[i].store(ref, std::memory_order_release);
+        if (ref && ref->color.load(std::memory_order_relaxed) == WHITE) {
+            std::unique_lock lock(mutex);
+            Color expected = BLACK;
+            Color desired = GRAY;
+            if (src->color.compare_exchange_strong(expected, desired, std::memory_order_acquire, std::memory_order_relaxed)) {
+                worklist.push_back(src);
+            }
         }
     }
     
@@ -102,18 +91,23 @@ namespace gch3 {
                     if (!worklist.empty()) {
                         object = worklist.front();
                         worklist.pop_front();
-                        //assert(object->color == GRAY);
-                        object->color = BLACK;
-                        for (Object* field : object->slots) {
-                            if (field && field->color == WHITE) {
-                                field->color = GRAY;
-                                worklist.push_back(field);
-                            }
-                        }
+                        Color color = object->color.exchange(BLACK, std::memory_order_release);
+                        assert(color == GRAY);
                     }
                 }
                 if (!object)
                     break;
+                for (std::atomic<Object*>& field : object->slots) {
+                    Object* ref = field.load(std::memory_order_acquire);
+                    if (ref) {
+                        std::unique_lock lock(mutex);
+                        Color expected = WHITE;
+                        Color desired = GRAY;
+                        if (ref->color.compare_exchange_strong(expected, desired, std::memory_order_release, std::memory_order_relaxed))
+                            worklist.push_back(ref);
+                    }
+                }
+
                                 
             }
             
@@ -178,27 +172,27 @@ namespace gch3 {
                 auto last = objects.end();
                 for (; middle != last; ++middle) {
                     Object* ref = *middle;
-                    Color color = WHITE;
-                    {
-                        std::unique_lock lock(mutex);
-                        color = ref->color;
-                        if (color == BLACK)
-                            ref->color = WHITE; // reset the color
-                    }
-                    if (color == WHITE) {
-                        // free the inacessible object
-                        delete ref;
-                        ++freed;
-                    } else {
-                        // move it up in the list
-                        *first = ref;
-                        ++first;
+                    Color expected = BLACK;
+                    Color desired = WHITE;
+                    ref->color.compare_exchange_weak(expected, desired, std::memory_order_relaxed, std::memory_order_acquire);
+                    switch (expected) {
+                        case WHITE:
+                            delete ref;
+                            ++freed;
+                            break;
+                        case GRAY:
+                            // the mutator can be turning new allocations gray
+                            [[fallthrough]];
+                        case BLACK:
+                            *first = ref;
+                            ++first;
+                            break;
                     }
                 }
                 size_t n = objects.size();
                 objects.erase(first, last);
                 size_t m = objects.size();
-                // printf("     freed %zu objects %zu -> %zu (%zu)\n", freed, n, m, n-m);
+                printf("     freed %zu objects %zu -> %zu (%zu)\n", freed, n, m, n-m);
                 
             }
             
@@ -207,8 +201,65 @@ namespace gch3 {
         }
     }
     
+    std::vector<Object*> nodesFromRoot(Object* root) {
+        std::set<Object*> set;
+        std::vector<Object*> vector;
+        vector.push_back(root);
+        set.emplace(root);
+        for (int i = 0; i != vector.size(); ++i) {
+            Object* src = vector[i];
+            for (int j = 0; j != SLOTS; ++j) {
+                Object* ref = src->slots[j].load(std::memory_order_relaxed);
+                if (ref) {
+                    auto [_, flag] = set.insert(ref);
+                    if (flag) {
+                        vector.push_back(ref);
+                    }
+                }
+            }
+        }
+        return vector;
+    }
     
+    std::pair<std::set<Object*>, std::set<std::pair<Object*, Object*>>> nodesEdgesFromRoot(Object* root) {
+        std::set<Object*> nodes;
+        std::set<std::pair<Object*, Object*>> edges;
+        std::stack<Object*> stack;
+        stack.push(root);
+        nodes.emplace(root);
+        while (!stack.empty()) {
+            Object* src = stack.top();
+            stack.pop();
+            for (int i = 0; i != SLOTS; ++i) {
+                Object* ref = src->slots[i].load(std::memory_order_relaxed);
+                if (ref) {
+                    auto [_, flag] = nodes.insert(ref);
+                    if (flag) {
+                        stack.push(ref);
+                    }
+                    edges.emplace(src, ref);
+                }
+            }
+        }
+        return std::pair(std::move(nodes), std::move(edges));
+    }
     
+    void printObjectGraph(Object* root) {
+        
+        auto [nodes, edges] = nodesEdgesFromRoot(root);
+        
+        std::map<Object*, int> labels;
+        int count = 0;
+        for (Object* object : nodes) {
+            labels.emplace(object, count++);
+        }
+
+        printf("%zu nodes\n", nodes.size());
+        printf("%zu edges\n", edges.size());
+        for (auto [a, b] : edges) {
+            printf("  (%d) -> (%d)\n", labels[a], labels[b]);
+        }
+    }
     
     
     void mutate() {
@@ -217,7 +268,7 @@ namespace gch3 {
         
         auto allocate = []() -> Object* {
             Object* infant = new Object();
-            infant->color = BLACK;
+            infant->color.store(BLACK, std::memory_order_relaxed);
             {
                 std::unique_lock lock(mutex);
                 infants.push_back(infant);
@@ -226,15 +277,20 @@ namespace gch3 {
         };
         
         std::vector<Object*> roots;
-        std::vector<Object*> known;
+        std::vector<Object*> nodes;
+        
+        roots.push_back(allocate());
+        nodes = nodesFromRoot(roots.back());
+        
         for (;;) {
             {
                 std::unique_lock lock(mutex);
                 if (worklist_request_roots) {
                     assert(roots.size() <= 1);
                     for (Object* ref : roots) {
-                        if (ref->color == WHITE) {
-                            ref->color = GRAY;
+                        Color expected = WHITE;
+                        Color desired = GRAY;
+                        if (ref->color.compare_exchange_strong(expected, desired, std::memory_order_release, std::memory_order_relaxed)) {
                             worklist.push_back(ref);
                         }
                     }
@@ -243,62 +299,32 @@ namespace gch3 {
                 }
             }
             
-            // printf("allocated %zd\n", allocated);
-            // do some work
+            printf("allocated %zd\n", allocated);
+            // do some graph work
             
-            // We record objects we know about here as we explore the graph
-            // They are kept live only by the graph, so when we mutate the
-            // graph we must forget about them since some of them may have
-            // been lost
+            assert(!nodes.empty()); // we should at least have the root
             
-            for (int i = 0; i != 1000; ++i) {
-
-                if (roots.empty()) {
-                    Object* ref = allocate(); // black until next roots export
-                    roots.push_back(ref); // live by roots
-                }
-                
-                if (known.empty()) {
-                    known.push_back(roots.back());
-                }
-
-                if (known.size() < 1 + rand() % 10) {
-                    int j = rand() % known.size();
-                    int k = rand() % SLOTS;
-                    // lock?
-                    Object* ref = Read(known[j], k);
-                    if (ref) {
-                        known.push_back(ref);
-                    }
-                    continue;
-                }
-
-                int j = rand() % known.size();
-                int k = rand() % SLOTS;
-                int l = rand() % known.size();
-                {
-                    switch (rand() % 3) {
-                        case 0:
-                            Write(known[j], k, nullptr);
-                            break;
-                        case 1:
-                            ++allocated;
-                            Write(known[j], k, allocate());
-                            break;
-                        case 2:
-                            Write(known[j], k, known[l]);
-                            break;
-                    }
-                }
-                // When we mutated the graph we could have lost our paths to
-                // these elements so we have to forget them and rebuild our
-                // knowledge
-                known.clear();
-                // This is only because we are randomly hacking at a random
-                // graph, we don't have to start every operation from the root
-                // in normal code
-                
+            // choose two nodes and a slot
+            int j = rand() % nodes.size();
+            int k = rand() % SLOTS;
+            int l = rand() % nodes.size();
+            Object* p = nullptr;
+            
+            if (nodes.size() < rand() % 100) {
+                // add a new node
+                p = allocate();
+                ++allocated;
+            } else if (nodes.size() < rand() % 100) {
+                // add a new edge betweene existing nodes
+                p = nodes[l];
             }
+            Write(nodes[j], k, p);
+            // Whatever we wrote may have overwritten an existing edge
+            
+            nodes = nodesFromRoot(roots.back());
+            
+            printObjectGraph(roots.back());
+            
             
         }
     }
