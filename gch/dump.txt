@@ -542,3 +542,299 @@ namespace gch2 {
         //
         // shade(src[i])
         // src[i] <- ref
+
+
+   Object* Read(Object* src, std::size_t i) {
+        assert(src);
+        assert(i < SLOTS);
+        // The mutator thread is already ordered wrt the fields
+        return src->slots[i].load(std::memory_order_relaxed);
+    }
+        
+    
+    void Write(Object* src, std::size_t i, Object* ref, bool* dirty) {
+        assert(src);
+        assert(i < SLOTS);
+        // src is reachable, because the mutator reached it
+        // ref is reachable (or nullptr), because the mutator reached it
+
+        
+        if (Object* old = src->slots[i].exchange(ref, std::memory_order_release)) {
+            // old was reachable, because the mutator just reached it
+            
+            // The store is RELEASE because the collector will dereference the
+            // pointer so writes to its Object must happen-before the store
+            
+            // The load part is RELAXED because the mutator itself perfomed the
+            // original store
+            
+            // src may be BLACK and ref may be WHITE; we have just violated
+            // the strong tricolor invariant
+            
+            // old may have been part of the chain by which such a WHITE ref
+            // was reached, so we GRAY it; we have just preserved the weak
+            // tricolor invariant
+            
+            Mark expected = UNMARKED;
+            if (old->mark.compare_exchange_strong(expected,
+                                                  MARKED,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+                // We race the collector to transition old from UNMARKED:WHITE
+                // to MARKED:GRAY.
+                
+                // Memory order is relaxed because no memory is published by
+                // this operation.  Synchronization is ultimately achieved via
+                // the handshake.
+                
+                assert(expected == UNMARKED);
+                *dirty = true;
+                
+                // When the collector is unable to find any GRAY items, it
+                // rendevous with each thread and clears the dirty flag.
+                //
+                // If the collector saw any set flag, it must scan again for
+                // GRAY items.
+                //
+                // Dirty assists in discovering GRAYs made between the
+                // collector's last inspection of a white object, and the
+                // handshake.
+                //
+                // The mutator can only produce GRAY objects by reaching
+                // WHITE objects, so it can no longer produce GRAY when the
+                // scan is actually complete.
+                //
+                // Allowed operations are 
+                // - WHITE -> GRAY, performed by both the mutator and collector
+                // - GRAY -> BLACK, performed only by the collector
+                // - allocate BLACK, performed only by the mutator
+                // so we cannot run indefinitely; in fact we can do only
+                // do up to the initial number of WHITE objects of each
+                // transition, so we will terminate.
+                //
+                // Newly allocated BLACK objects are of no interest to the
+                // mark phase.  We can incorporate them en masse when we
+                // sweep.
+                
+
+            } else {
+                assert(expected == MARKED);
+            }
+        }
+
+    }
+
+
+
+    enum Color : intptr_t {
+        WHITE,
+        GRAY,
+        BLACK,
+    };
+    
+    constexpr const char* ColorNames[3] = {
+        [WHITE] = "WHITE",
+        [GRAY] = "GRAY",
+        [BLACK] = "BLACK",
+    };
+
+
+
+
+ struct TestObject : Object {
+        
+        Slot<TestObject> slots[SLOTS];
+        
+        virtual ~TestObject() override = default;
+        [[nodiscard]] virtual std::size_t _gc_scan() const override;
+        
+    };
+    
+    // When the collector scans an object it may see any of the values a slot
+    // has taken on since the last handshake
+    
+    // The collector must load-acquire the pointers because of the ordering
+    // - handshake
+    // - mutator allocates A
+    // - mutator writes A into B[i]    RELEASE
+    // - collector reads B[i]          ACQUIRE
+    // - collector dereferences A
+    
+    std::size_t TestObject::_gc_scan() const {
+        std::size_t count = 0;
+        for (const auto& slot : slots)
+            if (Object::_gc_shade(slot.load(std::memory_order_acquire)))
+                ++count;
+        return count;
+    }
+    
+    
+    
+    
+    
+    std::vector<TestObject*> nodesFromRoot(TestObject* root) {
+        std::set<TestObject*> set;
+        std::vector<TestObject*> vector;
+        vector.push_back(root);
+        set.emplace(root);
+        for (int i = 0; i != vector.size(); ++i) {
+            TestObject* src = vector[i];
+            for (int j = 0; j != SLOTS; ++j) {
+                TestObject* ref = src->slots[j].load();
+                if (ref) {
+                    auto [_, flag] = set.insert(ref);
+                    if (flag) {
+                        vector.push_back(ref);
+                    }
+                }
+            }
+        }
+        return vector;
+    }
+    
+    std::pair<std::set<TestObject*>, std::set<std::pair<TestObject*, TestObject*>>> nodesEdgesFromRoot(TestObject* root) {
+        std::set<TestObject*> nodes;
+        std::set<std::pair<TestObject*, TestObject*>> edges;
+        std::stack<TestObject*> stack;
+        stack.push(root);
+        nodes.emplace(root);
+        while (!stack.empty()) {
+            TestObject* src = stack.top();
+            stack.pop();
+            for (int i = 0; i != SLOTS; ++i) {
+                TestObject* ref = src->slots[i].load();
+                if (ref) {
+                    auto [_, flag] = nodes.insert(ref);
+                    if (flag) {
+                        stack.push(ref);
+                    }
+                    edges.emplace(src, ref);
+                }
+            }
+        }
+        return std::pair(std::move(nodes), std::move(edges));
+    }
+    
+    void printObjectGraph(TestObject* root) {
+        
+        auto [nodes, edges] = nodesEdgesFromRoot(root);
+        
+        std::map<TestObject*, int> labels;
+        int count = 0;
+        for (TestObject* object : nodes) {
+            labels.emplace(object, count++);
+        }
+
+        printf("%zu nodes\n", nodes.size());
+        printf("%zu edges\n", edges.size());
+        for (auto [a, b] : edges) {
+            printf("  (%d) -> (%d)\n", labels[a], labels[b]);
+        }
+    }
+    
+    
+    
+    
+    void mutate() {
+                
+        size_t allocated = 0;
+        
+        std::vector<TestObject*> local_roots;
+        bool local_dirty = true;
+        std::vector<Object*> local_infants;
+        
+        auto allocate = [&local_infants]() -> TestObject* {
+            TestObject* infant = new TestObject();
+            local_infants.push_back(infant);
+            return infant;
+        };
+        
+        local_roots.push_back(allocate());
+
+        std::vector<TestObject*> nodes;
+        nodes = nodesFromRoot(local_roots.back());
+                
+        for (;;) {
+
+            // Handshake
+            
+            {
+                bool pending;
+                bool collector_dirty = false;
+                {
+                    std::unique_lock lock(channel.mutex);
+                    pending = channel.pending;
+                    if (pending) {
+                        
+                        collector_dirty = channel.dirty;
+
+                        if (channel.dirty)
+                            local_dirty = true;
+                        channel.dirty = local_dirty;
+                        local_dirty = false;
+                        
+                        if (channel.dirty) {
+                            local_dirty = true;
+                        } else {
+                            channel.dirty = local_dirty;
+                        }
+
+                        assert(channel.objects.empty());
+                        channel.objects.swap(local_infants);
+                        assert(local_infants.empty());
+
+                        channel.pending = false;
+                    }
+                }
+                if (pending) {
+                    channel.condition_variable.notify_all();
+                }
+
+                if (collector_dirty) {
+                    for (TestObject* ref : local_roots)
+                        if (Object::_gc_shade(ref))
+                            local_dirty = true;
+                }
+                
+
+            }
+
+            
+            printf("Total objects allocated %zd\n", allocated);
+            // do some graph work
+            
+            for (int i = 0; i != 100; ++i) {
+                
+                assert(!nodes.empty()); // we should at least have the root
+                
+                // choose two nodes and a slot
+                int j = rand() % nodes.size();
+                int k = rand() % SLOTS;
+                int l = rand() % nodes.size();
+                TestObject* p = nullptr;
+                
+                if (nodes.size() < rand() % 100) {
+                    // add a new node
+                    p = allocate();
+                    ++allocated;
+                } else if (nodes.size() < rand() % 100) {
+                    // add a new edge betweene existing nodes
+                    p = nodes[l];
+                }
+                // Write(nodes[j], k, p, &local_dirty);
+                if (nodes[j]->slots[k].store(p))
+                    local_dirty = true;
+                // Whatever we wrote may have overwritten an existing edge
+                
+                nodes = nodesFromRoot(local_roots.back());
+                
+                // printObjectGraph(roots.back());
+                
+            }
+            
+            
+        }
+    }
+    
+
+    

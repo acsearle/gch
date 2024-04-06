@@ -15,367 +15,278 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <concepts>
 
 
 namespace gch3 {
-    
-    enum Color : intptr_t {
-        WHITE,
-        GRAY,
-        BLACK,
-    };
-    
-    constexpr const char* ColorNames[3] = {
-        [WHITE] = "WHITE",
-        [GRAY] = "GRAY",
-        [BLACK] = "BLACK",
-    };
-    
-    enum Mark : intptr_t {
-        MARKED = 0,
+        
+    enum Mark 
+    : intptr_t           // <-- machine word
+    {
+          MARKED = 0,    // <-- objects are allocated in MARKED state
         UNMARKED = 1,
     };
-
-    constexpr const char* MarkNames[3] = {
-        [MARKED] = "MARKED",
+    
+    constexpr const char* MarkNames[] = {
+        [  MARKED] =   "MARKED",
         [UNMARKED] = "UNMARKED",
     };
-
-    constexpr std::size_t SLOTS = 6;
     
-    struct Object;
-            
-    enum Requests {
-        REQUEST_ROOTS = 1,
-        REQUEST_DIRTY = 2,
-        REQUEST_INFANTS = 4,
-    };
-
-    std::mutex mutex;
-    std::condition_variable condition_variable;
-    
-    int request_flags = 0;
-    bool dirty = false;
-    std::vector<Object*> infants;
-        
-    // mutator informs collector it made grays since last handshake
-    
-    // collector requests mutator mark its roots GRAY
-    // this makes more sense when scanning a thread stack; otherwise why not
-    // just have the collector share the roots and scan them at will?
+    // Color / Mark / Worklist states
+    //
+    //     WHITE <=> UNMARKED
+    //      GRAY <=> MARKED and in the WORKLIST
+    //     BLACK <=> MARKED and not in the WORKLIST
+    //
+    // Object lifecycle:
+    //
+    //     / -> BLACK
+    //            when the mutator allocates a new Object
+    //
+    // BLACK -> WHITE
+    // WHITE -> /
+    //            when the collector completes a cycle
+    //
+    // WHITE -> GRAY
+    //            when the mutator marks its roots
+    //            when the mutator overwrites a pointer to the Object
+    //            when the collector traces a pointer to the Object
+    //
+    // GRAY  -> BLACK
+    //            when the collector traces the Object's own fields
     //
     
-    struct alignas(64) Object {
+    struct Object {
         
-        // 8 : __vtbl
-        // 8 : mark
-                                           
-        mutable std::atomic<Mark> mark = MARKED;
-        std::atomic<Object*> slots[SLOTS];
-        
+        // void* __vtbl;                         // <-- hidden pointer
+                                                   
+        mutable std::atomic<Mark> _gc_mark = MARKED; // <-- zero initialize
+                                            
         virtual ~Object() = default;
-        
-        virtual std::size_t scan() const;
 
+        // MARK; WHITE -> GRAY
+        [[nodiscard]] static std::size_t _gc_shade(Object*);
+
+        // shade(fields)
+        [[nodiscard]] virtual std::size_t _gc_scan() const = 0;
+        
+        // UNMARK; BLACK -> WHITE
+        void _gc_clear() const;
+
+
+    }; // struct Object
+
+    std::size_t Object::_gc_shade(Object* object) {
+        Mark expected = UNMARKED;
+        return object && object->_gc_mark.compare_exchange_strong(expected,
+                                                                  MARKED,
+                                                                  std::memory_order_relaxed,
+                                                                  std::memory_order_relaxed);
+    }
+    
+    void Object::_gc_clear() const {
+        _gc_mark.store(UNMARKED, std::memory_order_relaxed);
+    }
+
+
+    
+    
+    
+    
+    // Mutator-collector handshake channel
+    //
+    // The mutator must periodically check in for pending requests from the
+    // mutator.
+    //
+    // - to mark its roots
+    // - to report if it has produced any WHITE -> GRAY transitions since last asked
+    // - to export its pending allocations
+    //
+
+    struct Channel {
+        
+        std::mutex mutex;
+        std::condition_variable condition_variable;
+        
+        bool pending = false;
+        
+        bool dirty = false;
+        std::vector<Object*> objects;
+        
     };
-    
-    Object* Read(Object* src, std::size_t i) {
-        assert(src);
-        assert(i < SLOTS);
-        // The mutator thread is already ordered wrt the fields
-        return src->slots[i].load(std::memory_order_relaxed);
-    }
-        
-    
-    void Write(Object* src, std::size_t i, Object* ref, bool* dirty) {
-        assert(src);
-        assert(i < SLOTS);
-        // src is reachable, because the mutator reached it
-        // ref is reachable (or nullptr), because the mutator reached it
 
-        
-        if (Object* old = src->slots[i].exchange(ref, std::memory_order_release)) {
-            // old was reachable, because the mutator just reached it
-            
-            // The store is RELEASE because the collector will dereference the
-            // pointer so writes to its Object must happen-before the store
-            
-            // The load part is RELAXED because the mutator itself perfomed the
-            // original store
-            
-            // src may be BLACK and ref may be WHITE; we have just violated
-            // the strong tricolor invariant
-            
-            // old may have been part of the chain by which such a WHITE ref
-            // was reached, so we GRAY it; we have just preserved the weak
-            // tricolor invariant
-            
-            Mark expected = UNMARKED;
-            if (old->mark.compare_exchange_strong(expected,
-                                                  MARKED,
-                                                  std::memory_order_relaxed,
-                                                  std::memory_order_relaxed)) {
-                // We race the collector to transition old from UNMARKED:WHITE
-                // to MARKED:GRAY.
-                
-                // Memory order is relaxed because no memory is published by
-                // this operation.  Synchronization is ultimately achieved via
-                // the handshake.
-                
-                assert(expected == UNMARKED);
-                *dirty = true;
-                
-                // When the collector is unable to find any GRAY items, it
-                // rendevous with each thread and clears the dirty flag.
-                //
-                // If the collector saw any set flag, it must scan again for
-                // GRAY items.
-                //
-                // Dirty assists in discovering GRAYs made between the
-                // collector's last inspection of a white object, and the
-                // handshake.
-                //
-                // The mutator can only produce GRAY objects by reaching
-                // WHITE objects, so it can no longer produce GRAY when the
-                // scan is actually complete.
-                //
-                // Allowed operations are 
-                // - WHITE -> GRAY, performed by both the mutator and collector
-                // - GRAY -> BLACK, performed only by the collector
-                // - allocate BLACK, performed only by the mutator
-                // so we cannot run indefinitely; in fact we can do only
-                // do up to the initial number of WHITE objects of each
-                // transition, so we will terminate.
-                //
-                // Newly allocated BLACK objects are of no interest to the
-                // mark phase.  We can incorporate them en masse when we
-                // sweep.
-                
-
-            } else {
-                assert(expected == MARKED);
-            }
-        }
-
-    }
+    Channel channel;
     
-    std::size_t Object::scan() const {
-        std::size_t count = 0;
-        for (std::atomic<Object*> const& field : slots) {
-            Object* ref = field.load(std::memory_order_acquire);
-            if (ref) {
-                Mark expected = UNMARKED;
-                if (ref->mark.compare_exchange_strong(expected,
-                                                      MARKED,
-                                                      std::memory_order_relaxed,
-                                                      std::memory_order_relaxed)) {
-                    // ref was UNMARKED:WHITE and is now MARKED:GRAY
-                    assert(expected == UNMARKED);
-                    ++count;
-                } else {
-                    // ref is MARKED:GRAY or MARKED:BLACK
-                    assert(expected == MARKED);
-                }
-            }
-        }
-        return count;
-    }
     
     void collect() {
         
         size_t freed = 0;
         
         std::vector<Object*> objects;
-        std::vector<Object*> local_infants;
+        std::vector<Object*> infants;
+        bool dirty;
+        
+        // The mutator may concurrently allocate BLACK objects at any time
+        
         for (;;) {
             
-            // step 1, get roots snapshot
-            {
-                std::unique_lock lock(mutex);
-                request_flags = REQUEST_ROOTS;
-                while (request_flags) {
-                    condition_variable.wait(lock);
-                }
-                // thread has now turned white roots gray
-            }
+            // "objects" contains only BLACK objects
+            // Recently allocated objects are BLACK
             
-            // step 2, process worklist
-            {
-                
-                // "objects" contains all objects that survived the last
-                // collection and were marked WHITE.
-                //
-                // "objects" does not contain newly allocated objects
-                
-                // Objects starts all WHITE
-                
-                // The mutator GRAYS its roots (above) and concurrently with our
-                // marking, the mutator write barrier generates more GRAY
-                // objects.
-                
-                // The collector walks the list of objects inspecting their
-                // color.  GRAY objects are BLACKENED, flipping more objects
-                // GRAY.
-             
-                // objects.begin()
-                //     MARKED:BLACK
-                // first
-                //     UNMARKED:WHITE or MARKED:GRAY to be processed
-                // last
-                //     was UNMARKED:WHITE when processed but may turn MARKED:GRAY concurrently
-                // end
-                
-                auto first = objects.begin();
-                
-                printf("Scanning %zu objects\n", objects.size());
-                                
-                for (;;) {
-                    
-                    auto last = objects.end();
-                    
-                    std::size_t count = 0;
-                    
-                    while (first != last) {
-                        
-                        Object* src = *first;
-                        assert(src);
-                        // Read color
-                        Mark mark = src->mark.load(std::memory_order_relaxed);
-                        switch (mark) {
-                            case MARKED: {
-                                // src is MARKED:GRAY
-                                count += src->scan();
-                                // src becomes MARKED:BLACK
-                                ++first;
-                                break;
-                            }
-                            case UNMARKED: {
-                                // src is UNMARKED:WHITE
-                                --last;
-                                if (first != last)
-                                    std::swap(*first, *last);
-                                break;
-                            }
-                        } // switch (src->mark)
-                    } // while(first != last)
-                    
-                    // We've now looked at every object
-                    // Black ones will stay black and require no further action
-                    // They have beem moved to the front of the list
-                    
-                    // White ones have been moved to the back of the list, but
-                    // once there they may have been GRAYED by
-                    // - the mutator write barrier shading a victim
-                    // - the collector scanning a GRAY object
-                    
-                    // Do we need to scan again?
-                    
-                    printf("    Transformed WHITE -> GRAY : %zd\n", count);
-                    
-                    if (count != 0) {
-                        printf("  Rescanning %zu of %zu objects (collector made GRAYS)\n",
-                               objects.end() - first,
-                               objects.size());
-                        continue;
-                    }
-                    
-                    // Since we BLACKENED every GRAY we found, and we made no
-                    // new GRAYS, any GRAYS in the list must be from the
-                    // mutator GRAYING a WHITE we had already processed.
-                                        
-                    {
-                        bool local_dirty;
-                        {
-                            std::unique_lock lock(mutex);
-                            request_flags = REQUEST_DIRTY | REQUEST_INFANTS;
-                            while (request_flags) {
-                                condition_variable.wait(lock);
-                            }
-                            local_dirty = dirty;
-                            local_infants.insert(local_infants.end(), infants.begin(), infants.end());
-                            infants.clear();
-                        }
-                        if (!local_dirty)
-                            break;
-                    }
-                    
-                    printf("  Rescanning %zu objects (mutator made GRAYS)\n", objects.end() - first);
+            // All objects are BLACK
 
-                    // the mutator made new GRAYs, so we have to scan again
-                    // to find them, or to prove that we got them last scan
-                    
-                } // scan the reduced was-WHITE partition again
+            // The collector sets these objects BLACK -> WHITE
+
+            for (Object* object : objects)
+                object->_gc_clear();
+            
+            // The mutator roots may now be WHITE
+            dirty = true;
+
+            // The mutator may now encounter WHITE objects
+            // The mutator write barrier may set some WHITE objects GRAY
+            // The mutator may now encounter GRAY objects
+            
+            // The WORKLIST is the range first, objects.end()
+            // The BLACKLIST is the range objects.begin(), first
+
+            // All objects in the BLACKLIST are BLACK
+            // All objects in the WORKLIST are GRAY or WHITE
+            
+            auto first = objects.begin();
+            
+            // Begin marking
+                        
+            for (;;) {
                 
-                // we have proved there are no GRAY objects
-                // TODO: we could assert this here with one last sweep
-                printf("  Terminates with [ BLACK : %zd , WHITE : %zd)\n", first - objects.begin(), objects.end() - first);
-                
+                // Initiate handshake
                 {
-                    // The unreachable objects extend from first to objects.end()
-                    auto n = objects.size();
-                    auto first2 = first;
-                    auto last = objects.end();
-                    for (; first2 != last; ++first2) {
-                        Object* ref = *first2;
-                        assert(ref->mark.load(std::memory_order_relaxed) == UNMARKED);
-                        delete ref;
-                        ++freed;
+                    std::unique_lock lock(channel.mutex);
+                    channel.pending = true;
+                    channel.dirty = dirty;
+                    while (channel.pending)
+                        channel.condition_variable.wait(lock);
+                    dirty = channel.dirty;
+                    assert(infants.empty());
+                    infants.swap(channel.objects);
+                }
+                
+                first = objects.insert(first,
+                                       infants.begin(),
+                                       infants.end()) + infants.size();
+                infants.clear();
+
+                if (!dirty)
+                    break;
+                dirty = false;
+
+                std::size_t count;
+                do {
+                    count = 0;
+                    for (auto last = objects.end(); first != last;) {
+                        Object* src = *first;
+                        Mark mark = src->_gc_mark.load(std::memory_order_relaxed);
+                        if (mark == MARKED) {
+                            count += src->_gc_scan();
+                            ++first;
+                        } else {
+                            --last;
+                            if (first != last)
+                                std::swap(*first, *last);
+                        }
                     }
-                    objects.erase(first, last);
-                    auto m = objects.size();
-                    printf("  Swept %zu objects total, %zu -> %zu (%zu)\n", freed, n, m, n-m);
-                }
+                } while (count);
                 
-                
-                
+                // On the most recent pass, the collector turned all GRAY
+                // objects it found BLACK, and made no new GRAY objects, so
+                // the WORKLIST can only contain GRAY objects if the mutator
+                // has made some since the last handshake
+                                
             }
             
-            // worklist is now empty
-            // everything reachable from roots is black
-            // everything newly allocated is black
-            // the mutator has no whites to insert into black
+            // Free all WHITE objects
             
-            // does it make sense to ask for more roots here?
-            // everything the mutator could have installed in its roots was
-            // reachable from the original roots, or allocated since it exported
-            // the roots
-            
-            // if this is true, the roots should all be black at this point
-            
-            // multiple threads may change this argument?
-            
-            // step 3, sweep
             {
-                // put the newly allocated objects at the end, reusing where
-                // the WHITEs used to be.
-                objects.insert(objects.end(), local_infants.begin(), local_infants.end());
-                local_infants.clear(); // capacity unchanged
-                
-                for (Object* ref : objects) {
-#ifdef NDEBUG
-                    ref->mark.store(UNMARKED, std::memory_order_relaxed);
-#else
-                    Mark old = ref->mark.exchange(UNMARKED, std::memory_order_relaxed);
-                    assert(old == MARKED);
-#endif
+                auto first2 = first;
+                auto last = objects.end();
+                for (; first2 != last; ++first2) {
+                    Object* ref = *first2;
+                    assert(ref && ref->_gc_mark.load(std::memory_order_relaxed) == UNMARKED);
+                    delete ref;
+                    ++freed;
                 }
-                
+                objects.erase(first, last);
+                printf("Total objects freed     %zu\n", freed);
             }
-            
-            
+          
+            // Start a new collection cycle
             
         }
+        
+    }
+
+    
+    template<typename T>
+    struct Slot {
+        
+        std::atomic<T*> slot = nullptr;
+        
+        [[nodiscard]] T* load(std::memory_order order
+                              = std::memory_order_relaxed) const {
+            return slot.load(order);
+        }
+        
+        [[nodiscard]] std::size_t store(T* ref,
+                                 std::memory_order order
+                                 = std::memory_order_release) {
+            return Object::_gc_shade(slot.exchange(ref, order));
+        }
+        
+    };
+    
+    
+    constexpr std::size_t SLOTS = 6;
+    
+    struct TestObject : Object {
+        
+        Slot<TestObject> slots[SLOTS];
+        
+        virtual ~TestObject() override = default;
+        [[nodiscard]] virtual std::size_t _gc_scan() const override;
+        
+    };
+    
+    // When the collector scans an object it may see any of the values a slot
+    // has taken on since the last handshake
+    
+    // The collector must load-acquire the pointers because of the ordering
+    // - handshake
+    // - mutator allocates A
+    // - mutator writes A into B[i]    RELEASE
+    // - collector reads B[i]          ACQUIRE
+    // - collector dereferences A
+    
+    std::size_t TestObject::_gc_scan() const {
+        std::size_t count = 0;
+        for (const auto& slot : slots)
+            if (Object::_gc_shade(slot.load(std::memory_order_acquire)))
+                ++count;
+        return count;
     }
     
-    std::vector<Object*> nodesFromRoot(Object* root) {
-        std::set<Object*> set;
-        std::vector<Object*> vector;
+    
+    
+    
+    
+    std::vector<TestObject*> nodesFromRoot(TestObject* root) {
+        std::set<TestObject*> set;
+        std::vector<TestObject*> vector;
         vector.push_back(root);
         set.emplace(root);
         for (int i = 0; i != vector.size(); ++i) {
-            Object* src = vector[i];
+            TestObject* src = vector[i];
             for (int j = 0; j != SLOTS; ++j) {
-                Object* ref = src->slots[j].load(std::memory_order_relaxed);
+                TestObject* ref = src->slots[j].load();
                 if (ref) {
                     auto [_, flag] = set.insert(ref);
                     if (flag) {
@@ -387,17 +298,17 @@ namespace gch3 {
         return vector;
     }
     
-    std::pair<std::set<Object*>, std::set<std::pair<Object*, Object*>>> nodesEdgesFromRoot(Object* root) {
-        std::set<Object*> nodes;
-        std::set<std::pair<Object*, Object*>> edges;
-        std::stack<Object*> stack;
+    std::pair<std::set<TestObject*>, std::set<std::pair<TestObject*, TestObject*>>> nodesEdgesFromRoot(TestObject* root) {
+        std::set<TestObject*> nodes;
+        std::set<std::pair<TestObject*, TestObject*>> edges;
+        std::stack<TestObject*> stack;
         stack.push(root);
         nodes.emplace(root);
         while (!stack.empty()) {
-            Object* src = stack.top();
+            TestObject* src = stack.top();
             stack.pop();
             for (int i = 0; i != SLOTS; ++i) {
-                Object* ref = src->slots[i].load(std::memory_order_relaxed);
+                TestObject* ref = src->slots[i].load();
                 if (ref) {
                     auto [_, flag] = nodes.insert(ref);
                     if (flag) {
@@ -410,13 +321,13 @@ namespace gch3 {
         return std::pair(std::move(nodes), std::move(edges));
     }
     
-    void printObjectGraph(Object* root) {
+    void printObjectGraph(TestObject* root) {
         
         auto [nodes, edges] = nodesEdgesFromRoot(root);
         
-        std::map<Object*, int> labels;
+        std::map<TestObject*, int> labels;
         int count = 0;
-        for (Object* object : nodes) {
+        for (TestObject* object : nodes) {
             labels.emplace(object, count++);
         }
 
@@ -434,19 +345,19 @@ namespace gch3 {
                 
         size_t allocated = 0;
         
-        std::vector<Object*> local_roots;
-        bool local_dirty = false;
+        std::vector<TestObject*> local_roots;
+        bool local_dirty = true;
         std::vector<Object*> local_infants;
         
-        auto allocate = [&local_infants]() -> Object* {
-            Object* infant = new Object();
+        auto allocate = [&local_infants]() -> TestObject* {
+            TestObject* infant = new TestObject();
             local_infants.push_back(infant);
             return infant;
         };
         
         local_roots.push_back(allocate());
 
-        std::vector<Object*> nodes;
+        std::vector<TestObject*> nodes;
         nodes = nodesFromRoot(local_roots.back());
                 
         for (;;) {
@@ -454,38 +365,44 @@ namespace gch3 {
             // Handshake
             
             {
-                int local_request_flags;
+                bool pending;
+                bool collector_dirty = false;
                 {
-                    std::unique_lock lock(mutex);
-                    local_request_flags = request_flags;
-                    
-                    if (request_flags) {
-                        if (request_flags & REQUEST_ROOTS) {
-                            assert(local_roots.size() <= 1);
-                            for (Object* ref : local_roots) {
-                                Mark expected = UNMARKED;
-                                if (ref->mark.compare_exchange_strong(expected,
-                                                                      MARKED,
-                                                                      std::memory_order_relaxed,
-                                                                      std::memory_order_relaxed)) {
-                                    local_dirty = true;
-                                }
-                            }
+                    std::unique_lock lock(channel.mutex);
+                    pending = channel.pending;
+                    if (pending) {
+                        
+                        collector_dirty = channel.dirty;
+
+                        if (channel.dirty)
+                            local_dirty = true;
+                        channel.dirty = local_dirty;
+                        local_dirty = false;
+                        
+                        if (channel.dirty) {
+                            local_dirty = true;
+                        } else {
+                            channel.dirty = local_dirty;
                         }
-                        if (request_flags & REQUEST_DIRTY) {
-                            dirty = local_dirty;
-                            local_dirty = false;
-                        }
-                        if (request_flags & REQUEST_INFANTS) {
-                            assert(infants.empty());
-                            infants.swap(local_infants);
-                            assert(local_infants.empty());
-                        }
-                        request_flags = 0;
+
+                        assert(channel.objects.empty());
+                        channel.objects.swap(local_infants);
+                        assert(local_infants.empty());
+
+                        channel.pending = false;
                     }
                 }
-                if (local_request_flags)
-                    condition_variable.notify_all();
+                if (pending) {
+                    channel.condition_variable.notify_all();
+                }
+
+                if (collector_dirty) {
+                    for (TestObject* ref : local_roots)
+                        if (Object::_gc_shade(ref))
+                            local_dirty = true;
+                }
+                
+
             }
 
             
@@ -500,7 +417,7 @@ namespace gch3 {
                 int j = rand() % nodes.size();
                 int k = rand() % SLOTS;
                 int l = rand() % nodes.size();
-                Object* p = nullptr;
+                TestObject* p = nullptr;
                 
                 if (nodes.size() < rand() % 100) {
                     // add a new node
@@ -510,7 +427,9 @@ namespace gch3 {
                     // add a new edge betweene existing nodes
                     p = nodes[l];
                 }
-                Write(nodes[j], k, p, &local_dirty);
+                // Write(nodes[j], k, p, &local_dirty);
+                if (nodes[j]->slots[k].store(p))
+                    local_dirty = true;
                 // Whatever we wrote may have overwritten an existing edge
                 
                 nodes = nodesFromRoot(local_roots.back());
