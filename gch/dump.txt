@@ -461,3 +461,84 @@ namespace gch2 {
     
     
 }
+
+
+
+
+        
+        // Steele
+        //
+        // Causes rescan.  The original value is already traced.  The new
+        // value will be traced unless it is overwritten again before the
+        // tracing completes.
+        //
+        // Causes BLACK -> GRAY transitions
+        //
+        // Conservatively retains some of the intermediate values of src[i]
+        //
+        // Terminates when the mutators can no longer access any WHITE values
+        // to write, i.e. we have MARKED all live objects.
+        //
+        //  src[i] <- ref;
+        //  if isBlack(src)
+        //      if isWhite(ref)
+        //          revert(src)
+        /*
+        src->slots[i].store(ref, std::memory_order_release);
+        if (ref && ref->color.load(std::memory_order_relaxed) == WHITE) {
+            std::unique_lock lock(mutex);
+            Color expected = BLACK;
+            Color desired = GRAY;
+            if (src->color.compare_exchange_strong(expected, desired, std::memory_order_acquire, std::memory_order_relaxed)) {
+                worklist.push_back(src);
+            }
+        }
+         */
+
+        // Boehm
+        //
+        // Unconditionally rescans after any write.  Termination needs to
+        // prevent these writes for long enough to trace all the GRAY.
+        //
+        //  src[i] <- ref
+        //  if isBlack(src)
+        //      revert(src)
+        /*
+        std::unique_lock lock(mutex);
+        Color expected = BLACK;
+        Color desired = GRAY;
+        if (src->color.compare_exchange_strong(expected, desired, std::memory_order_acquire, std::memory_order_relaxed)) {
+            worklist.push_back(src);
+        }
+         */
+
+        // Djikstra
+        //
+        // Never rescans so there is a progress guarantee.
+        //
+        //  src[i] <- ref
+        //  if isBlack(src)
+        //     shade(ref)
+        /*
+        if (ref && src->color.load(std::memory_order_relaxed) == BLACK) {
+            std::unique_lock lock(mutex);
+            Color expected = WHITE;
+            Color desired = GRAY;
+            ref->color.compare_exchange_strong(expected, desired, std::memory_order_release, std::memory_order_relaxed);
+        }
+         */
+        
+        // Yuasa
+        //
+        // if not isBlack(src)
+        //     shade(src[i]
+        // src[i] <- ref
+        
+        // Unconditional delete barrier
+        //
+        // Has the interesting property that the retained set is actually well
+        // defined, as everything that was reachable at any point during the
+        // mark stage will be retained.
+        //
+        // shade(src[i])
+        // src[i] <- ref

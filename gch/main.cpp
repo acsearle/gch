@@ -19,30 +19,6 @@
 
 namespace gch3 {
     
-    constexpr std::size_t SLOTS = 7;
-    
-    struct Object;
-            
-    enum Requests {
-        REQUEST_ROOTS = 1,
-        REQUEST_DIRTY = 2,
-        REQUEST_INFANTS = 4,
-    };
-
-    std::mutex mutex;
-    std::condition_variable condition_variable;
-    
-    int request_flags;
-    bool dirty;
-    std::vector<Object*> infants;
-        
-    // mutator informs collector it made grays since last handshake
-    
-    // collector requests mutator mark its roots GRAY
-    // this makes more sense when scanning a thread stack; otherwise why not
-    // just have the collector share the roots and scan them at will?
-    //
-
     enum Color : intptr_t {
         WHITE,
         GRAY,
@@ -55,9 +31,52 @@ namespace gch3 {
         [BLACK] = "BLACK",
     };
     
-    struct Object {
-        std::atomic<Color> color = BLACK;
+    enum Mark : intptr_t {
+        MARKED = 0,
+        UNMARKED = 1,
+    };
+
+    constexpr const char* MarkNames[3] = {
+        [MARKED] = "MARKED",
+        [UNMARKED] = "UNMARKED",
+    };
+
+    constexpr std::size_t SLOTS = 6;
+    
+    struct Object;
+            
+    enum Requests {
+        REQUEST_ROOTS = 1,
+        REQUEST_DIRTY = 2,
+        REQUEST_INFANTS = 4,
+    };
+
+    std::mutex mutex;
+    std::condition_variable condition_variable;
+    
+    int request_flags = 0;
+    bool dirty = false;
+    std::vector<Object*> infants;
+        
+    // mutator informs collector it made grays since last handshake
+    
+    // collector requests mutator mark its roots GRAY
+    // this makes more sense when scanning a thread stack; otherwise why not
+    // just have the collector share the roots and scan them at will?
+    //
+    
+    struct alignas(64) Object {
+        
+        // 8 : __vtbl
+        // 8 : mark
+                                           
+        mutable std::atomic<Mark> mark = MARKED;
         std::atomic<Object*> slots[SLOTS];
+        
+        virtual ~Object() = default;
+        
+        virtual std::size_t scan() const;
+
     };
     
     Object* Read(Object* src, std::size_t i) {
@@ -75,83 +94,6 @@ namespace gch3 {
         // ref is reachable (or nullptr), because the mutator reached it
 
         
-        // Steele
-        //
-        // Causes rescan.  The original value is already traced.  The new
-        // value will be traced unless it is overwritten again before the
-        // tracing completes.
-        //
-        // Causes BLACK -> GRAY transitions
-        //
-        // Conservatively retains some of the intermediate values of src[i]
-        //
-        // Terminates when the mutators can no longer access any WHITE values
-        // to write, i.e. we have MARKED all live objects.
-        //
-        //  src[i] <- ref;
-        //  if isBlack(src)
-        //      if isWhite(ref)
-        //          revert(src)
-        /*
-        src->slots[i].store(ref, std::memory_order_release);
-        if (ref && ref->color.load(std::memory_order_relaxed) == WHITE) {
-            std::unique_lock lock(mutex);
-            Color expected = BLACK;
-            Color desired = GRAY;
-            if (src->color.compare_exchange_strong(expected, desired, std::memory_order_acquire, std::memory_order_relaxed)) {
-                worklist.push_back(src);
-            }
-        }
-         */
-
-        // Boehm
-        //
-        // Unconditionally rescans after any write.  Termination needs to
-        // prevent these writes for long enough to trace all the GRAY.
-        //
-        //  src[i] <- ref
-        //  if isBlack(src)
-        //      revert(src)
-        /*
-        std::unique_lock lock(mutex);
-        Color expected = BLACK;
-        Color desired = GRAY;
-        if (src->color.compare_exchange_strong(expected, desired, std::memory_order_acquire, std::memory_order_relaxed)) {
-            worklist.push_back(src);
-        }
-         */
-
-        // Djikstra
-        //
-        // Never rescans so there is a progress guarantee.
-        //
-        //  src[i] <- ref
-        //  if isBlack(src)
-        //     shade(ref)
-        /*
-        if (ref && src->color.load(std::memory_order_relaxed) == BLACK) {
-            std::unique_lock lock(mutex);
-            Color expected = WHITE;
-            Color desired = GRAY;
-            ref->color.compare_exchange_strong(expected, desired, std::memory_order_release, std::memory_order_relaxed);
-        }
-         */
-        
-        // Yuasa
-        //
-        // if not isBlack(src)
-        //     shade(src[i]
-        // src[i] <- ref
-        
-        // Unconditional delete barrier
-        //
-        // Has the interesting property that the retained set is actually well
-        // defined, as everything that was reachable at any point during the
-        // mark stage will be retained.
-        //
-        // shade(src[i])
-        // src[i] <- ref
-        
         if (Object* old = src->slots[i].exchange(ref, std::memory_order_release)) {
             // old was reachable, because the mutator just reached it
             
@@ -168,17 +110,19 @@ namespace gch3 {
             // was reached, so we GRAY it; we have just preserved the weak
             // tricolor invariant
             
-            Color expected = WHITE;
-            if (old->color.compare_exchange_strong(expected,
-                                                   GRAY,
-                                                   std::memory_order_relaxed,
-                                                   std::memory_order_relaxed)) {
-                // We race the collector to transition old from WHITE to GREY
+            Mark expected = UNMARKED;
+            if (old->mark.compare_exchange_strong(expected,
+                                                  MARKED,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+                // We race the collector to transition old from UNMARKED:WHITE
+                // to MARKED:GRAY.
+                
                 // Memory order is relaxed because no memory is published by
                 // this operation.  Synchronization is ultimately achieved via
                 // the handshake.
                 
-                assert(expected == WHITE);
+                assert(expected == UNMARKED);
                 *dirty = true;
                 
                 // When the collector is unable to find any GRAY items, it
@@ -209,10 +153,32 @@ namespace gch3 {
                 
 
             } else {
-                assert(expected == GRAY || expected == BLACK);
+                assert(expected == MARKED);
             }
         }
 
+    }
+    
+    std::size_t Object::scan() const {
+        std::size_t count = 0;
+        for (std::atomic<Object*> const& field : slots) {
+            Object* ref = field.load(std::memory_order_acquire);
+            if (ref) {
+                Mark expected = UNMARKED;
+                if (ref->mark.compare_exchange_strong(expected,
+                                                      MARKED,
+                                                      std::memory_order_relaxed,
+                                                      std::memory_order_relaxed)) {
+                    // ref was UNMARKED:WHITE and is now MARKED:GRAY
+                    assert(expected == UNMARKED);
+                    ++count;
+                } else {
+                    // ref is MARKED:GRAY or MARKED:BLACK
+                    assert(expected == MARKED);
+                }
+            }
+        }
+        return count;
     }
     
     void collect() {
@@ -252,66 +218,45 @@ namespace gch3 {
                 // GRAY.
              
                 // objects.begin()
-                //     BLACK
+                //     MARKED:BLACK
                 // first
-                //     ?
+                //     UNMARKED:WHITE or MARKED:GRAY to be processed
                 // last
-                //     WHITE (when observed)
+                //     was UNMARKED:WHITE when processed but may turn MARKED:GRAY concurrently
                 // end
                 
                 auto first = objects.begin();
                 
-                printf("Scan %zu objects\n", objects.size());
+                printf("Scanning %zu objects\n", objects.size());
                                 
                 for (;;) {
                     
                     auto last = objects.end();
                     
-                    std::ptrdiff_t gray_to_black = 0;
-                    std::ptrdiff_t white_to_gray = 0;
+                    std::size_t count = 0;
                     
                     while (first != last) {
                         
                         Object* src = *first;
                         assert(src);
-                        // Read color and turn GRAY to BLACK
-                        Color expected = GRAY;
-                        Color desired = BLACK;
-                        if (src->color.compare_exchange_strong(expected, 
-                                                               desired,
-                                                               std::memory_order_acquire,
-                                                               std::memory_order_relaxed)) {
-                            ++gray_to_black;
-                            // shade the children
-                            for (std::atomic<Object*>& field : src->slots) {
-                                Object* ref = field.load(std::memory_order_acquire);
-                                if (ref) {
-                                    std::unique_lock lock(mutex);
-                                    Color expected = WHITE;
-                                    Color desired = GRAY;
-                                    if (ref->color.compare_exchange_strong(expected,
-                                                                           desired,
-                                                                           std::memory_order_relaxed,
-                                                                           std::memory_order_relaxed)) {
-                                        ++white_to_gray;
-                                    }
-                                }
+                        // Read color
+                        Mark mark = src->mark.load(std::memory_order_relaxed);
+                        switch (mark) {
+                            case MARKED: {
+                                // src is MARKED:GRAY
+                                count += src->scan();
+                                // src becomes MARKED:BLACK
+                                ++first;
+                                break;
                             }
-                        }
-                        switch (expected) {
-                            case WHITE:
-                                //printf("  WHITE -> end");
+                            case UNMARKED: {
+                                // src is UNMARKED:WHITE
                                 --last;
                                 if (first != last)
                                     std::swap(*first, *last);
                                 break;
-                            case GRAY: // was GRAY, we have blackened it
-                                //printf("  GRAY ->\n  ");
-                            case BLACK:
-                                //printf("  BLACK -> begin\n");
-                                ++first;
-                                break;
-                        }
+                            }
+                        } // switch (src->mark)
                     } // while(first != last)
                     
                     // We've now looked at every object
@@ -325,10 +270,12 @@ namespace gch3 {
                     
                     // Do we need to scan again?
                     
-                    printf("    Transformed WHITE -> GRAY : %zd , GRAY -> BLACK : %zd\n", white_to_gray, gray_to_black);
+                    printf("    Transformed WHITE -> GRAY : %zd\n", count);
                     
-                    if (white_to_gray != 0) {
-                        printf("  Rescanning %zu objects (collector made GRAYS)\n", objects.end() - first);
+                    if (count != 0) {
+                        printf("  Rescanning %zu of %zu objects (collector made GRAYS)\n",
+                               objects.end() - first,
+                               objects.size());
                         continue;
                     }
                     
@@ -370,7 +317,7 @@ namespace gch3 {
                     auto last = objects.end();
                     for (; first2 != last; ++first2) {
                         Object* ref = *first2;
-                        assert(ref->color.load(std::memory_order_relaxed) == WHITE);
+                        assert(ref->mark.load(std::memory_order_relaxed) == UNMARKED);
                         delete ref;
                         ++freed;
                     }
@@ -406,10 +353,10 @@ namespace gch3 {
                 
                 for (Object* ref : objects) {
 #ifdef NDEBUG
-                    ref->color.store(BLACK, std::memory_order_relaxed);
+                    ref->mark.store(UNMARKED, std::memory_order_relaxed);
 #else
-                    Color old = ref->color.exchange(WHITE, std::memory_order_relaxed);
-                    assert(old == BLACK);
+                    Mark old = ref->mark.exchange(UNMARKED, std::memory_order_relaxed);
+                    assert(old == MARKED);
 #endif
                 }
                 
@@ -511,16 +458,18 @@ namespace gch3 {
                 {
                     std::unique_lock lock(mutex);
                     local_request_flags = request_flags;
+                    
                     if (request_flags) {
                         if (request_flags & REQUEST_ROOTS) {
                             assert(local_roots.size() <= 1);
                             for (Object* ref : local_roots) {
-                                Color expected = WHITE;
-                                Color desired = GRAY;
-                                ref->color.compare_exchange_strong(expected,
-                                                                   desired,
-                                                                   std::memory_order_relaxed,
-                                                                   std::memory_order_relaxed);
+                                Mark expected = UNMARKED;
+                                if (ref->mark.compare_exchange_strong(expected,
+                                                                      MARKED,
+                                                                      std::memory_order_relaxed,
+                                                                      std::memory_order_relaxed)) {
+                                    local_dirty = true;
+                                }
                             }
                         }
                         if (request_flags & REQUEST_DIRTY) {
@@ -528,8 +477,9 @@ namespace gch3 {
                             local_dirty = false;
                         }
                         if (request_flags & REQUEST_INFANTS) {
-                            infants.insert(infants.end(), local_infants.begin(), local_infants.end());
-                            local_infants.clear();
+                            assert(infants.empty());
+                            infants.swap(local_infants);
+                            assert(local_infants.empty());
                         }
                         request_flags = 0;
                     }
@@ -539,7 +489,7 @@ namespace gch3 {
             }
 
             
-            printf("allocated %zd\n", allocated);
+            printf("Total objects allocated %zd\n", allocated);
             // do some graph work
             
             for (int i = 0; i != 100; ++i) {
