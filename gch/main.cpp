@@ -114,11 +114,39 @@ namespace gch3 {
         std::vector<Object*> objects;
         
     };
+    
+    constexpr std::size_t THREADS = 3;
 
-    Channel channel;
+    Channel channels[THREADS] = {};
     
     
     void collect() {
+        
+        // TODO: inserting infants is expensive
+        
+        // what if we maintain a blacklist, whitelist, and worklist
+        // pass through worklist moving entries to black or whitelist
+        // swap whitelist to empty worklist for next iteration
+        // finally, delete all white, whiten all black, blacklist becomes worklist
+        //
+        // at any time, we can append the infants to the blacklist
+        
+        // TODO: pointer chasing is expensive
+        // What if we keep the lists sorted?  We will then access memory
+        // in order, at least, and can predict runs?
+        
+        // TODO: long chains are pathological
+        //
+        // Suppose we have a linked list and lots of unreachable objects
+        // When we sweep over the objects, we find the GRAY node in the list
+        // and scan it to GRAY another node somewhere in the list.  We will
+        // have to walk half the unreachable objects to find it, on average, and
+        // thus we will do O(N) sweeps to collect a list of N nodes.
+        //
+        // But, the collector will make the great majority of GRAYs so we know
+        // where they are.  We only need to sweep to find the ones made by the
+        // mutators.  We don't want to blow the stack by recursing, so we can
+        // get the scanning to make an explicit graystack
         
         size_t freed = 0;
         
@@ -158,35 +186,56 @@ namespace gch3 {
             // Begin marking
                         
             for (;;) {
-                
-                // Initiate handshake
-                {
-                    std::unique_lock lock(channel.mutex);
-                    channel.pending = true;
-                    channel.dirty = dirty;
-                    while (channel.pending)
-                        channel.condition_variable.wait(lock);
-                    dirty = channel.dirty;
-                    assert(infants.empty());
-                    infants.swap(channel.objects);
+                                
+                // Initiate handshake with all threads
+                for (std::size_t i = 0; i != THREADS; ++i) {
+                    std::unique_lock lock(channels[i].mutex);
+                    //printf("Collector acquires lock %zu\n", i);
+                    //printf("Collector requests handshake\n");
+                    //printf("Collector says it is %s\n", dirty ? "dirty" : "clean");
+                    channels[i].pending = true;
+                    channels[i].dirty = dirty;
+                    //printf("Collector releases lock %zu\n", i);
                 }
                 
-                first = objects.insert(first,
-                                       infants.begin(),
-                                       infants.end()) + infants.size();
-                infants.clear();
-
+                // Wait for all handshakes to complete
+                for (std::size_t i = 0; i != THREADS; ++i) {
+                    {
+                        std::unique_lock lock(channels[i].mutex);
+                        //printf("Collector acquires lock %zu\n", i);
+                        while (channels[i].pending) {
+                            //printf("Collector sees handshake is pending %zu\n", i);
+                            //printf("Collector wait-releases %zu\n", i);
+                            channels[i].condition_variable.wait(lock);
+                            //printf("Collector acquire-wakes %zu\n", i);
+                        }
+                        //printf("Collector sees handshake with %zu is complete\n", i);
+                        //printf("Mutator %zu says it is %s\n", i, dirty ? "dirty" : "clean");
+                        if (channels[i].dirty)
+                            dirty = true;
+                        assert(infants.empty());
+                        infants.swap(channels[i].objects);
+                        //printf("Collector releases lock %zu\n", i);
+                    }
+                    first = objects.insert(first,
+                                           infants.begin(),
+                                           infants.end()) + infants.size();
+                    infants.clear();
+                }
+                
                 if (!dirty)
                     break;
-                dirty = false;
-
+                
                 std::size_t count;
                 do {
+                    //printf("Collector searches for GRAY\n");
+                    std::size_t gray_found = 0;
                     count = 0;
                     for (auto last = objects.end(); first != last;) {
                         Object* src = *first;
                         Mark mark = src->_gc_mark.load(std::memory_order_relaxed);
                         if (mark == MARKED) {
+                            ++gray_found;
                             count += src->_gc_scan();
                             ++first;
                         } else {
@@ -195,12 +244,15 @@ namespace gch3 {
                                 std::swap(*first, *last);
                         }
                     }
+                   // printf("Collector made %zu GRAY, found %zu GRAY\n", count, gray_found);
                 } while (count);
-                
+                                
                 // On the most recent pass, the collector turned all GRAY
                 // objects it found BLACK, and made no new GRAY objects, so
                 // the WORKLIST can only contain GRAY objects if the mutator
                 // has made some since the last handshake
+                
+                dirty = false;
                                 
             }
             
@@ -231,15 +283,34 @@ namespace gch3 {
         
         std::atomic<T*> slot = nullptr;
         
-        [[nodiscard]] T* load(std::memory_order order
-                              = std::memory_order_relaxed) const {
+        [[nodiscard]] T* 
+        load(std::memory_order order = std::memory_order_relaxed) const {
             return slot.load(order);
         }
         
-        [[nodiscard]] std::size_t store(T* ref,
-                                 std::memory_order order
-                                 = std::memory_order_release) {
-            return Object::_gc_shade(slot.exchange(ref, order));
+        [[nodiscard]] std::size_t 
+        store(T* desired,
+              std::memory_order order = std::memory_order_release) {
+            return Object::_gc_shade(slot.exchange(desired, order));
+        }
+
+        [[nodiscard]] std::pair<T*, std::size_t> 
+        exchange(T* desired,
+                 std::memory_order order = std::memory_order_release) {
+            Object* found = slot.exchange(found, order);
+            return { Object::_gc_shade(found), found };
+        }
+
+        [[nodiscard]] std::pair<bool, std::size_t>
+        compare_exchange(T*& expected, 
+                         T* desired,
+                         std::memory_order success = std::memory_order_release,
+                         std::memory_order failure = std::memory_order_relaxed) {
+            bool flag = compare_exchange(expected,
+                                         desired,
+                                         success,
+                                         failure);
+            return { flag, flag ? Object::_gc_shade(expected) : 0 };
         }
         
     };
@@ -341,24 +412,26 @@ namespace gch3 {
     
     
     
-    void mutate() {
+    void mutate(const std::size_t index) {
+        
+        //printf("Thread %zu begins\n", index);
                 
         size_t allocated = 0;
         
-        std::vector<TestObject*> local_roots;
-        bool local_dirty = true;
-        std::vector<Object*> local_infants;
+        std::vector<TestObject*> roots;
+        bool dirty = false;
+        std::vector<Object*> infants;
         
-        auto allocate = [&local_infants]() -> TestObject* {
+        auto allocate = [&infants]() -> TestObject* {
             TestObject* infant = new TestObject();
-            local_infants.push_back(infant);
+            infants.push_back(infant);
             return infant;
         };
         
-        local_roots.push_back(allocate());
+        roots.push_back(allocate());
 
         std::vector<TestObject*> nodes;
-        nodes = nodesFromRoot(local_roots.back());
+        nodes = nodesFromRoot(roots.back());
                 
         for (;;) {
 
@@ -366,47 +439,43 @@ namespace gch3 {
             
             {
                 bool pending;
-                bool collector_dirty = false;
+                bool collector_was_dirty = false;
                 {
-                    std::unique_lock lock(channel.mutex);
-                    pending = channel.pending;
+                    std::unique_lock lock(channels[index].mutex);
+                    //printf("Thread %zu acquired lock\n", index);
+                    pending = channels[index].pending;
                     if (pending) {
-                        
-                        collector_dirty = channel.dirty;
+                        //printf("Thread %zu performs handshake\n", index);
 
-                        if (channel.dirty)
-                            local_dirty = true;
-                        channel.dirty = local_dirty;
-                        local_dirty = false;
-                        
-                        if (channel.dirty) {
-                            local_dirty = true;
-                        } else {
-                            channel.dirty = local_dirty;
-                        }
+                        collector_was_dirty = channels[index].dirty;
+                        channels[index].dirty = dirty;
+                        dirty = false;
 
-                        assert(channel.objects.empty());
-                        channel.objects.swap(local_infants);
-                        assert(local_infants.empty());
+                        assert(channels[index].objects.empty());
+                        channels[index].objects.swap(infants);
+                        assert(infants.empty());
 
-                        channel.pending = false;
+                        channels[index].pending = false;
                     }
-                }
-                if (pending) {
-                    channel.condition_variable.notify_all();
+                    //printf("Thread %zu release lock\n", index);
                 }
 
-                if (collector_dirty) {
-                    for (TestObject* ref : local_roots)
+                if (pending) {
+                    //printf("Thread %zu notifies\n", index);
+                    channels[index].condition_variable.notify_all();
+                }
+
+                if (collector_was_dirty) {
+                    for (TestObject* ref : roots)
                         if (Object::_gc_shade(ref))
-                            local_dirty = true;
+                            dirty = true;
                 }
                 
 
             }
 
             
-            printf("Total objects allocated %zd\n", allocated);
+            // printf("Thread total objects allocated %zd\n", allocated);
             // do some graph work
             
             for (int i = 0; i != 100; ++i) {
@@ -429,10 +498,11 @@ namespace gch3 {
                 }
                 // Write(nodes[j], k, p, &local_dirty);
                 if (nodes[j]->slots[k].store(p))
-                    local_dirty = true;
-                // Whatever we wrote may have overwritten an existing edge
+                    dirty = true;
                 
-                nodes = nodesFromRoot(local_roots.back());
+                if (dirty)
+                    // Whatever we wrote overwrote an existing edge
+                    nodes = nodesFromRoot(roots.back());
                 
                 // printObjectGraph(roots.back());
                 
@@ -454,8 +524,14 @@ namespace gch3 {
     
     void exercise() {
         std::thread collector(collect);
-        std::thread mutator(mutate);
-        mutator.join();
+        std::vector<std::thread> mutators;
+        for (std::size_t i = 0; i != THREADS; ++i) {
+            mutators.emplace_back(mutate, i);
+        }
+        while (!mutators.empty()) {
+            mutators.back().join();
+            mutators.pop_back();
+        }
         collector.join();
     }
     
