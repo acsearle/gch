@@ -283,8 +283,27 @@ namespace gch3 {
         
         std::atomic<T*> slot = nullptr;
         
-        [[nodiscard]] T* 
-        load(std::memory_order order = std::memory_order_relaxed) const {
+        // The default memory orders are for a thread working on its private
+        // data and releasing its writes to the collector thread
+        
+        // They are sufficient for a "producer" thread (it publishes pointers
+        // for the garbage collector dereference), and for other sorts of
+        // producer operation.
+        //
+        // A consumer thread must additionally ACQUIRE any pointer it will
+        // dereference
+        //     load -> std::memory_order_acquire
+        //     exchange -> std::memory_order_acq_rel
+        
+        // store operations include a WRITE BARRIER that shades the overwitten
+        // value from WHITE to GRAY
+        
+        // Raw pointers returned from these methods are safe until the next
+        // handshake.
+        
+        // atomic interface
+        
+        T* load(std::memory_order order = std::memory_order_relaxed) const {
             return slot.load(order);
         }
         
@@ -313,6 +332,67 @@ namespace gch3 {
             return { flag, flag ? Object::_gc_shade(expected) : 0 };
         }
         
+        
+        // pointer interface
+        
+        Slot() = default;
+                
+        explicit Slot(T* other) : slot(other) {}
+        
+        Slot(const Slot& other) : Slot(other.load()) {}
+        
+        template<typename U> explicit Slot(const Slot<U>& other) : Slot(other.load()) {}
+
+        ~Slot() = default;
+        
+        Slot& operator=(T* other) {
+            store(other);
+            return *this;
+        }
+        
+        Slot& operator=(const Slot& other) {
+            return operator=(other.load());
+        }
+        
+        template<typename U>
+        Slot& operator=(const Slot<U>& other) {
+            return operator=(other.load());
+        }
+                
+        explicit operator T*() const {
+            return load();
+        }
+        
+        explicit operator bool() const {
+            return static_cast<bool>(load());
+        }
+
+        T* operator->() const {
+            T* object = load();
+            assert(object);
+            return object;
+        }
+        
+        bool operator!() const {
+            return !load();
+        }
+        
+        T& operator*() const {
+            T* object = load();
+            assert(object);
+            return *object;
+        }
+        
+        template<typename U>
+        bool operator==(const Slot<U>& other) {
+            return load() == other.load();
+        }
+
+        template<typename U>
+        bool operator==(U* other) {
+            return load() == other;
+        }
+
     };
     
     
@@ -346,6 +426,61 @@ namespace gch3 {
     }
     
     
+    
+    template<typename T>
+    struct Node : Object {
+        Slot<Node> next;
+        T payload;
+        
+        virtual ~Node() override = default;
+        [[nodiscard]] virtual std::size_t _gc_scan() const override;
+        
+    };
+    
+    template<typename T>
+    [[nodiscard]] std::size_t Node<T>::_gc_scan() const {
+        return Object::_gc_shade(next.load(std::memory_order_acquire));
+    }
+
+        
+    template<typename T>
+    struct Stack {
+    
+        Slot<Node<T>> head;
+        
+        [[nodiscard]] std::size_t push(Node<T>* desired) {
+            std::size_t count = 0;
+            Node<T>* expected = head.load(std::memory_order_acquire);
+            for (;;) {
+                count += desired->next.store(expected);
+                auto [flag, delta] = head.compare_exchange_strong(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
+                count += delta;
+                if (flag)
+                    return count;
+            }
+        }
+        
+        [[nodiscard]] std::pair<bool, std::size_t> pop(T& victim) {
+            std::size_t count = 0;
+            Node<T>* expected = head.load(std::memory_order_acquire);
+            for (;;) {
+                if (expected == nullptr)
+                    return {false, count};
+                Node<T>* desired = expected->next.load(std::memory_order_acquire);
+                auto [flag, delta] = head.compare_exchange(expected, desired, std::memory_order_release, std::memory_order_acquire);
+                count += delta;
+                if (flag) {
+                    victim = std::move(expected->payload);
+                }
+            }
+        }
+        
+        std::size_t _gc_scan() {
+            Object::_gc_shade(head.load(std::memory_order_acquire));
+        }
+        
+    };
+
     
     
     
@@ -432,6 +567,19 @@ namespace gch3 {
 
         std::vector<TestObject*> nodes;
         nodes = nodesFromRoot(roots.back());
+        
+        // TODO:
+        // we need a mechanism for a thread to suspend without jamming the
+        // collector; a thread that is asleep won't make any GRAY, but
+        // neither can we ask it to export its roots
+        
+        // should the roots just live in the channel, and the collector is
+        // responsible for scanning them when needed?  Or just one global root?
+        // The notion of thread-specific roots is mainly for atomatically
+        // tracing stack variables
+        // which we can't support
+        
+        
                 
         for (;;) {
 
@@ -465,6 +613,8 @@ namespace gch3 {
                     channels[index].condition_variable.notify_all();
                 }
 
+                // The collector has set our roots white, we must reexpress our
+                // interest in them
                 if (collector_was_dirty) {
                     for (TestObject* ref : roots)
                         if (Object::_gc_shade(ref))
