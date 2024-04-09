@@ -7,126 +7,98 @@
 
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <deque>
 #include <iostream>
+#include <map>
 #include <queue>
+#include <set>
 #include <stack>
 #include <thread>
 #include <vector>
-#include <set>
-#include <map>
-#include <concepts>
-
 
 namespace gch3 {
-        
-    enum Mark : intptr_t // <-- machine word
-    {
-        MARKED,          // <-- objects are allocated in MARKED state
-        UNMARKED,
-        POISONED,
-    };
     
-    constexpr const char* MarkNames[] = {
-        [MARKED  ] = "MARKED",
-        [UNMARKED] = "UNMARKED",
-        [POISONED] = "POISONED",
-    };
-    
-    thread_local const char* thread_local_name = "main";
-    
-    // Color / Mark / Worklist states
-    //
-    //     WHITE <=> UNMARKED
-    //      GRAY <=> MARKED and in the WORKLIST
-    //     BLACK <=> MARKED and not in the WORKLIST
-    //
-    // Object lifecycle:
-    //
-    //     / -> BLACK
-    //            when the mutator allocates a new Object
-    //
-    // BLACK -> WHITE
-    // WHITE -> /
-    //            when the collector completes a cycle
-    //
-    // WHITE -> GRAY
-    //            when the mutator marks its roots
-    //            when the mutator overwrites a pointer to the Object
-    //            when the collector traces a pointer to the Object
-    //
-    // GRAY  -> BLACK
-    //            when the collector traces the Object's own fields
-    //
-    
+    // Base class of all garbage collected objects
+    // - virtual table for scan and finalize
+    // - object color for mark-sweep
+                    
     struct Object {
         
-        // void* __vtbl;                             // <-- hidden pointer
-                                                   
-        mutable std::atomic<Mark> _gc_mark = MARKED; // <-- zero initialize
-                                            
+        // void* __vtbl;
+        mutable std::atomic<int64_t> _gc_color;
+                            
+        Object();
         virtual ~Object() = default;
-
         
-        [[nodiscard]] static std::size_t _gc_shade(Object*); // WHITE -> GRAY
-        static void _gc_clear(Object*);                      // BLACK -> WHITE
-        static Object* _gc_validate(Object*);
-
+        static void _gc_shade(Object*);  // WHITE -> GRAY
+        
         // shade(fields)
-        [[nodiscard]] virtual std::size_t _gc_scan() const = 0;
+        virtual void _gc_scan() const = 0;
         
-
-
+        // debug
+        virtual void _gc_print() const = 0;
+        
     }; // struct Object
+    
+    static_assert(sizeof(Object) == 16);
+    static_assert(alignof(Object) == 8);
+    
+    // We change the color : integer mapping, and the allocation color, at
+    // separate points in the algorithm
+    
+    struct Configuration {
+        int64_t WHITE = 0; // <-- not reached yet
+        int64_t GRAY  = 1; // <-- will be scanned
+        int64_t BLACK = 2; // <-- was scanned
+        int64_t GREEN = 3; // <-- poison value
+        int64_t ALLOC = 0;
+        const char* color_names[4] = { "WHITE", "GRAY", "BLACK", "GREEN" };
+    };
+    
+    // We keep gc state in a thread_local to reduce awkward passing around of
+    // context arguments
+    
+    // TODO: thread_local can be expensive
+    
+    struct Local : Configuration {
+        const char* name = nullptr;
+        bool dirty = false;
+        std::vector<Object*> infants;
+    };
+    
+    thread_local Local local;
+    
+#define LOG(F, ...) printf("%s%c: " F, local.name, 'c' + local.dirty  __VA_OPT__(,) __VA_ARGS__)
+    
+    Object::Object() : _gc_color(local.ALLOC) {
+        // LOG("allocates %p as %s\n", this, local.color_names[local.ALLOC]);
+        local.infants.push_back(this);
+    }
 
-    std::size_t Object::_gc_shade(Object* object) {
-        if (!object)
-            return 0;
-        Mark expected = UNMARKED;
-        object->_gc_mark.compare_exchange_strong(expected,
-                                                 MARKED,
-                                                 std::memory_order_relaxed,
-                                                 std::memory_order_relaxed);
-        switch (expected) {
-            case UNMARKED:
-                printf("%p: UNMARKED -> MARKED    %s\n", object, thread_local_name);
-                return 1;
-            case MARKED:
-                return 0;
-            default:
-                printf("%p: POISONED %zd           %s\n", object, expected, thread_local_name);
-                abort();
-        }
-    }
-    
-    void Object::_gc_clear(Object* object) {
-        // TODO: revert me
-        // _gc_mark.store(UNMARKED, std::memory_order_relaxed);
-        Mark old = object->_gc_mark.exchange(UNMARKED, std::memory_order_relaxed);
-        printf("%p: MARKED -> UNMARKED     %s\n", object, thread_local_name);
-        assert(old == MARKED);
-    }
-    
-    Object* Object::_gc_validate(Object* object) {
+    void Object::_gc_shade(Object* object) {
         if (object) {
-            Mark mark = object->_gc_mark.load(std::memory_order_relaxed);
-            switch (mark) {
-                case MARKED:
-                case UNMARKED:
-                    break;;
-                case POISONED:
-                    printf("%p -> POISONED\n", object);
+            int64_t expected = local.WHITE;
+            bool result = object->_gc_color
+                .compare_exchange_strong(expected, local.GRAY,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed);
+            if (result) {
+                // LOG("shades %p %s -> GRAY\n", object, local.color_names[expected]);
+                assert(expected == local.WHITE);
+                local.dirty = true;
+            } else {
+                if (expected != local.GREEN) {
+                    // LOG("shades %p %s\n", object, local.color_names[expected]);
+                } else {
+                    LOG("shades %p %s\n --- FATAL ---\n", object, local.color_names[expected]);
                     abort();
-                default:
-                    printf("%p -> Mark{%zu}\n", object, mark);
-                    abort();
+                }
             }
+        } else {
+            // LOG("shades nullptr\n");
         }
-        return object;
     }
-
-
-    
     
     
     
@@ -138,207 +110,315 @@ namespace gch3 {
     // - to mark its roots
     // - to report if it has produced any WHITE -> GRAY transitions since last asked
     // - to export its pending allocations
-    //
-
+    // - to change its color <-> integer mapping
+    
     struct Channel {
         
         std::mutex mutex;
         std::condition_variable condition_variable;
         
         bool pending = false;
+        Configuration configuration;
         
         bool dirty = false;
-        std::vector<Object*> objects; // <-- objects the thread has allocated since last handshake
+        std::vector<Object*> infants; // <-- objects the thread has allocated since last handshake
         
     };
     
-    constexpr std::size_t THREADS = 1;
+    
+    // A steady state:
+    //
+    // All mutators are allocating WHITE.
+    // The write barrier shades some WHITE -> GRAY.
+    // The mutators are produding WHITE and GRAY objects.
+    // There are GRAY and WHITE objects.
+    // There are no BLACK objects.
+    //
+    // The collector requests mutators start allocating BLACK.
+    // Now some mutators allocate BLACK, some WHITE.
+    // The write barrier shades some objects WHITE to GRAY.
+    // All colors exist.
+    // The write barrier prevents the formation of BLACK nodes with WHITE
+    // children, because all writes GRAY the children.
+    // The mutators are producing objects of all colors.
+    //
+    // Handshakes complete.
+    // Now all mutators are allocating BLACK.
+    // All mutators have informed the collector of the objects it allocated
+    // WHITE.
+    // All mutators are shading WHITE to GRAY
+    // All mutators shade any WHITE roots GRAY between handshakes.
+    // The collector has been told about all objects that were allocated WHITE.
+    // The collector knows about all objects that are WHITE or GRAY.
+    // The collector does not know about allocated BLACK objects.
+    // The collector sweeps known objects and traces them.
+    // The tracing turns all GRAY objects BLACK, and some WHITE objects GRAY.
+    // The mutators turn WHITE objects GRAY, and make new BLACK objects.
+    // No new WHITE objects are being produced, so this cannot continue
+    // indefinitely.
+    // If there is no path to an object, it remains WHITE.
+    // The collector sweeps until it discovers no more GRAY objects to trace.
+    //
+    // The collector now considers there may be no GRAY objects.
+    // The mutators may have turned a WHITE object GRAY behind the collector,
+    // The collector initiates a handshake to see if the mutators have made any
+    // GRAY objects since the last handshake.  Note that the collector may
+    // not even see GRAY objects made by mutators until the handshake is
+    // performed, due to relaxed memory ordering.
+    //
+    // If some mutator has made GRAY objects (is dirty) then the collector
+    // continues scanning.
+    //
+    // If no mutator has made GRAY objects, then we have reached a steady
+    // state where all reachable objects are BLACK, and all WHITE objects are
+    // unreachable.  Some unreachable objects may also be BLACK, and they will
+    // not be reclaimed this cycle.
+    //
+    // All objects are BLACK or WHITE.
+    // All WHITE objects are known to the collector.
+    // Some recent BLACK allocations are not known to the collector.
+    // All WHITE objects are unreachable by the mutators.
+    // The mutators are allocating BLACK.
+    // The mutator write barrier can reach now WHITE objects so it makes no objects
+    // GRAY.
+    //
+    // The collector frees all WHITE objects.
+    //
+    // There are only BLACK objects.
+    // Some BLACK objects are known to the collector.
+    // Some BLACK objects are recently allocated and not known to the collector.
+    // The mutator write barrier encounters no WHITE objects to turn GRAY.
+    //
+    // The collector requests handshakes to SWAP the encoding of BLACK and WHITE.
+    //
+    // Pre-handshake mutators allocate BLACK and see BLACK objects.
+    // Post-handshake mutators allocate WHITE and see WHITE objects.
+    // The post-handshake mutators turn WHITE objects GRAY.
+    // The pre-handshake mutator may see these GRAY objects.
+    //
+    //
+    // All handshakes complete.
+    // All mutators now see
+    
+    
+    
+    
+    
+    constexpr std::size_t THREADS = 3;
 
     Channel channels[THREADS] = {};
-    
-    void hack_globals();
-    
+        
     void collect() {
         
-        thread_local_name = "collector";
-        
-        // TODO: inserting infants is expensive
-        
-        // what if we maintain a blacklist, whitelist, and worklist
-        // pass through worklist moving entries to black or whitelist
-        // swap whitelist to empty worklist for next iteration
-        // finally, delete all white, whiten all black, blacklist becomes worklist
-        //
-        // at any time, we can append the infants to the blacklist
-        
-        // TODO: pointer chasing is expensive
-        // What if we keep the lists sorted?  We will then access memory
-        // in order, at least, and can predict runs?
-        
-        // TODO: long chains are pathological
-        //
-        // Suppose we have a linked list and lots of unreachable objects
-        // When we sweep over the objects, we find the GRAY node in the list
-        // and scan it to GRAY another node somewhere in the list.  We will
-        // have to walk half the unreachable objects to find it, on average, and
-        // thus we will do O(N) sweeps to collect a list of N nodes.
-        //
-        // But, the collector will make the great majority of GRAYs so we know
-        // where they are.  We only need to sweep to find the ones made by the
-        // mutators.  We don't want to blow the stack by recursing, so we can
-        // get the scanning to make an explicit graystack
+        local.name = "C0";
         
         size_t freed = 0;
         
         std::vector<Object*> objects;
         std::vector<Object*> infants;
-        bool dirty;
-        
-        // The mutator may concurrently allocate BLACK objects at any time
-        
+                        
         for (;;) {
             
-            // "objects" contains only BLACK objects
-            // Recently allocated objects are BLACK
+            LOG("collection begins\n");
+
+            // Mutators allocate WHITE and mark GRAY
+            // There are no BLACK objects
             
-            // All objects are BLACK
-
-            // The collector sets these objects BLACK -> WHITE
-
-            printf("Collector: whitening %zu objects\n", objects.size());
+            /*
+            LOG("enumerating %zu known objects\n",  objects.size());
             for (Object* object : objects) {
-                assert(object);
-                Object::_gc_clear(object);
+                object->_gc_print();
+                intptr_t color = object->_gc_color.load(std::memory_order_relaxed);
+                assert(color == local.WHITE || color == local.GRAY);
             }
-
-            // The mutator roots may now be WHITE
-            dirty = true;
-
-            // The mutator may now encounter WHITE objects
-            // The mutator write barrier may set some WHITE objects GRAY
-            // The mutator may now encounter GRAY objects
+             */
             
-            // The WORKLIST is the range first, objects.end()
-            // The BLACKLIST is the range objects.begin(), first
-
-            // All objects in the BLACKLIST are BLACK
-            // All objects in the WORKLIST are GRAY or WHITE
+            assert(local.ALLOC == local.WHITE);
+            local.ALLOC = local.BLACK;
             
-            auto first = objects.begin();
+            LOG("begin transition to allocating BLACK\n");
             
-            // Begin marking
-                        
+            // initiate handshakes
+            for (std::size_t i = 0; i != THREADS; ++i) {
+                std::unique_lock lock(channels[i].mutex);
+                LOG("requests handshake %zu\n", i);
+                channels[i].pending = true;
+                channels[i].configuration = local;
+            }
+            
+            // receive handshakes
+            for (std::size_t i = 0; i != THREADS; ++i) {
+                std::unique_lock lock(channels[i].mutex);
+                while (channels[i].pending) {
+                    std::cv_status status
+                    = channels[i].condition_variable.wait_for(lock,
+                                                              std::chrono::seconds(1));
+                    if (status == std::cv_status::timeout) {
+                        LOG("timed out waiting for %zu\n --- FATAL ---\n", i);
+                        abort();
+                    }
+                }
+                assert(infants.empty());
+                infants.swap(channels[i].infants);
+                lock.unlock();
+                LOG("ingesting %zu objects from %zu\n", infants.size(), i);
+                while (!infants.empty()) {
+                    Object* object = infants.back();
+                    infants.pop_back();
+                    //object->_gc_print();
+                    objects.push_back(object);
+                }
+                infants.clear();
+            }
+            
+            LOG("end transition to allocating BLACK\n");
+            
             for (;;) {
-                                                
-                // Initiate handshake with all threads
-                for (std::size_t i = 0; i != THREADS; ++i) {
-                    std::unique_lock lock(channels[i].mutex);
-                    printf("Collector: locks %zu\n", i);
-                    printf("Collector: requests handshake\n");
-                    printf("Collector: publishes %s\n", dirty ? "dirty" : "clean");
-                    channels[i].pending = true;
-                    channels[i].dirty = dirty;
-                    printf("Collector: unlocks %zu\n", i);
-                }
                 
-                // Wait for all handshakes to complete
-                for (std::size_t i = 0; i != THREADS; ++i) {
-                    {
-                        std::unique_lock lock(channels[i].mutex);
-                        printf("Collector: locks %zu\n", i);
-                        while (channels[i].pending) {
-                            printf("Collector: waits on %zu\n", i);
-                            std::cv_status status
-                                = channels[i].condition_variable.wait_for(lock,
-                                                                          std::chrono::seconds(1));
-                            if (status == std::cv_status::timeout) {
-                                printf("Collector: timed out waiting for %zu\n", i);
-                                return;
-                            }
-                            printf("Collector: wakes on %zu\n", i);
-                        }
-                        printf("Collector: %zu reports it is %s\n", i, channels[i].dirty ? "dirty" : "clean");
-                        if (channels[i].dirty)
-                            dirty = true;
-                        assert(infants.empty());
-                        infants.swap(channels[i].objects);
-                        printf("Collector: %zu sends %zu new allocations\n", i, infants.size());
-                        printf("Collector: unlocks %zu\n", i);
-                    }
-                    first = objects.insert(first,
-                                           infants.begin(),
-                                           infants.end()) + infants.size();
-                    printf("Collector: ingests %zu new allocations from mutator %zu\n", infants.size(), i);
-                    infants.clear();
-                }
+                //LOG("enumerating %zu known objects\n",  objects.size());
+                //for (Object* object : objects) {
+                //    object->_gc_print();
+                //}
                 
-                if (!dirty)
-                    break;
-                
-                std::size_t count;
+                assert(!local.dirty);
+
                 do {
-                    printf("Collector: searches for GRAY\n");
-                    std::size_t gray_found = 0;
-                    count = 0;
-                    
+                    local.dirty = false;
+                    std::size_t blacks = 0;
+                    std::size_t grays = 0;
+                    std::size_t whites = 0;
+                    LOG("scanning...\n");
                     for (Object* object : objects) {
-                        assert(object && object->_gc_mark.load(std::memory_order_relaxed) != POISONED);
-                    }
-                    
-                    for (auto last = objects.end(); first != last;) {
-                        Object* src = *first;
-                        Mark mark = src->_gc_mark.load(std::memory_order_relaxed);
-                        if (mark == MARKED) {
-                            ++gray_found;
-                            count += src->_gc_scan();
-                            ++first;
-                        } else if (mark == UNMARKED) {
-                            --last;
-                            if (first != last)
-                                std::swap(*first, *last);
+                        //object->_gc_print();
+                        assert(object);
+                        int64_t expected = local.GRAY;
+                        object->_gc_color.compare_exchange_strong(expected,
+                                                                  local.BLACK,
+                                                                  std::memory_order_relaxed,
+                                                                  std::memory_order_relaxed);
+                        if (expected == local.BLACK) {
+                            ++blacks;
+                        } else if (expected == local.GRAY) {
+                            ++grays;
+                            object->_gc_scan(); // <-- will set local.dirty when it marks a node GRAY
+                        } else if (expected == local.WHITE) {
+                            ++whites;
                         } else {
                             abort();
                         }
                     }
-                   printf("Collector: GRAY  -> BLACK %zu\n"
-                          "           WHITE -> GRAY  %zu\n", gray_found, count);
-                } while (count);
-                                
-                // On the most recent pass, the collector turned all GRAY
-                // objects it found BLACK, and made no new GRAY objects, so
-                // the WORKLIST can only contain GRAY objects if the mutator
-                // has made some since the last handshake
+                    LOG("        ...scanning found %zu, %zu, %zu, 0\n", blacks, grays, whites);
+                } while (local.dirty);
                 
-                dirty = false;
-                                
+                assert(!local.dirty);
+                
+                // the collector has traced everything it knows about
+                
+                // handshake to see if the mutators have shaded any objects
+                // GRAY since the last handshake
+                
+                // initiate handshakes
+                for (std::size_t i = 0; i != THREADS; ++i) {
+                    std::unique_lock lock(channels[i].mutex);
+                    LOG("requests handshake %zu\n", i);
+                    channels[i].pending = true;
+                }
+
+                // receive handshakes
+                for (std::size_t i = 0; i != THREADS; ++i) {
+                    std::unique_lock lock(channels[i].mutex);
+                    while (channels[i].pending) {
+                        std::cv_status status
+                        = channels[i].condition_variable.wait_for(lock,
+                                                                  std::chrono::seconds(1));
+                        if (status == std::cv_status::timeout) {
+                            LOG("timed out waiting for %zu\n --- FATAL ---\n", i);
+                            abort();
+                        }
+                    }
+                    LOG("%zu reports it was %s\n", i, channels[i].dirty ? "dirty" : "clean");
+                    if (channels[i].dirty)
+                        local.dirty = true;
+                }
+                
+                if (!local.dirty)
+                    break;
+                
+                local.dirty = false;
+                
             }
             
-            // Free all WHITE objects
+            // Neither the collectors nor mutators marked any nodes GRAY since
+            // the last handshake.  All remaining WHITE objects are unreachable.
             
             {
-
-                auto first2 = first;
+                LOG("begin sweep\n");
+                std::size_t blacks = 0;
+                std::size_t whites = 0;
+                auto first = objects.begin();
                 auto last = objects.end();
-                printf("Collector: freeing %zu WHITE objects\n", last - first2);
-                for (; first2 != last; ++first2) {
-                    Object* ref = *first2;
-                    assert(ref && ref->_gc_mark.load(std::memory_order_relaxed) == UNMARKED);
-                    printf("%p: UNMARKED -> POISONED\n", ref);
-                    if (ref)
-                        ref->_gc_mark.store(POISONED, std::memory_order_relaxed);
-                    // delete ref;
-                    ++freed;
+                for (; first != last;) {
+                    Object* object = *first;
+                    assert(object);
+                    //object->_gc_print();
+                    int64_t color = object->_gc_color.load(std::memory_order_relaxed);
+                    if (color == local.BLACK) {
+                        ++blacks;
+                        ++first;
+                        //LOG("retains %p BLACK\n", object);
+                    } else if (color == local.WHITE) {
+                        ++whites;
+                        --last;
+                        if (first != last) {
+                            std::swap(*first, *last);
+                        }
+                        objects.pop_back();
+                        object->_gc_color.store(local.GREEN, std::memory_order_relaxed);
+                        //LOG("frees %p WHITE -> GREEN\n", object);
+                        delete object;
+                        ++freed;
+                    } else {
+                        LOG("sweep sees %s\n --- FATAL ---\n", local.color_names[color]);
+                        abort();
+                    }
+                    
                 }
-                objects.erase(first, last);
-                
-                for (Object* object : objects) {
-                    assert(object->_gc_mark.load(std::memory_order_relaxed) == MARKED);
-                }
-                
-                printf("Collector: lifetime objects freed %zu\n", freed);
+                LOG("swept %zu, 0, %zu, 0\n", blacks, whites);
+                LOG("freed %zu\n", whites);
+                LOG("lifetime freed %zu\n", freed);
             }
-          
-            // Start a new collection cycle
+            
+            // Only BLACK objects exist
+
+            // Reinterpret the colors
+            
+            std::swap(local.BLACK, local.WHITE);
+            std::swap(local.color_names[local.BLACK], local.color_names[local.WHITE]);
+            
+            // Publish the reinterpretation
+            for (std::size_t i = 0; i != THREADS; ++i) {
+                std::unique_lock lock(channels[i].mutex);
+                LOG("requests handshake %zu\n", i);
+                channels[i].pending = true;
+                channels[i].configuration = local;
+            }
+            
+            // receive handshakes
+            for (std::size_t i = 0; i != THREADS; ++i) {
+                std::unique_lock lock(channels[i].mutex);
+                while (channels[i].pending) {
+                    std::cv_status status
+                    = channels[i].condition_variable.wait_for(lock,
+                                                              std::chrono::seconds(1));
+                    if (status == std::cv_status::timeout) {
+                        LOG("timed out waiting for %zu\n --- FATAL ---\n", i);
+                        abort();
+                    }
+                }
+                LOG("%zu acknowledges recoloring\n", i);
+            }
+            
+            LOG("collection ends\n");
             
         }
         
@@ -374,31 +454,28 @@ namespace gch3 {
             return slot.load(order);
         }
         
-        [[nodiscard]] std::size_t 
+        void
         store(T* desired,
               std::memory_order order = std::memory_order_release) {
-            return Object::_gc_shade(slot.exchange(desired, order));
+            Object::_gc_shade(desired);
+            T* old = slot.exchange(desired, order);
+            Object::_gc_shade(old);
         }
 
-        /*
-        [[nodiscard]] std::pair<T*, std::size_t>
-        exchange(T* desired,
-                 std::memory_order order = std::memory_order_release) {
-            Object* found = slot.exchange(found, order);
-            return { found, Object::_gc_shade(found) };
-        }
-         */
-
-        [[nodiscard]] std::pair<bool, std::size_t>
-        compare_exchange_strong(T*& expected,
-                                T* desired,
-                                std::memory_order success = std::memory_order_release,
-                                std::memory_order failure = std::memory_order_relaxed) {
-            bool flag = slot.compare_exchange_strong(expected,
-                                                     desired,
-                                                     success,
-                                                     failure);
-            return { flag, flag ? Object::_gc_shade(expected) : 0 };
+        bool compare_exchange_strong(T*& expected,
+                                     T* desired,
+                                     std::memory_order success = std::memory_order_release,
+                                     std::memory_order failure = std::memory_order_relaxed) {
+            bool did_exchange = slot.compare_exchange_strong(expected,
+                                                             desired,
+                                                             success,
+                                                             failure);
+            if (did_exchange) {
+                Object::_gc_shade(expected);
+                Object::_gc_shade(desired);
+            }
+            return did_exchange;
+            
         }
         
         
@@ -475,8 +552,9 @@ namespace gch3 {
         T payload;
         
         virtual ~Node() override = default;
-        [[nodiscard]] virtual std::size_t _gc_scan() const override;
-        
+        virtual void _gc_scan() const override;
+        virtual void _gc_print() const override;
+
         explicit Node(auto&&... args)
         : payload(std::forward<decltype(args)>(args)...) {
         }
@@ -484,8 +562,46 @@ namespace gch3 {
     };
     
     template<typename T>
-    [[nodiscard]] std::size_t Node<T>::_gc_scan() const {
-        return Object::_gc_shade(next.load(std::memory_order_acquire));
+    void Node<T>::_gc_scan() const {
+        // LOG("scans %p %s\n", (Object*) this, local.color_names[_gc_color.load(std::memory_order_relaxed)]);
+        
+        // Implementation A: shade chold GRAY and return
+        // Object::_gc_shade(next.load(std::memory_order_acquire));
+        
+        // Implementation B:
+        // Trace white chains immediately
+        const Node<T>* parent = this;
+        for (;;) {
+            Node<T>* child = parent->next.load(std::memory_order_acquire);
+            if (!child)
+                return;
+            int64_t expected = local.WHITE;
+            // If WHITE, transform directly to BLACK and trace into that node
+            if (child->_gc_color.compare_exchange_strong(expected,
+                                                         local.BLACK,
+                                                         std::memory_order_relaxed,
+                                                         std::memory_order_relaxed)) {
+                local.dirty = true;
+                parent = child;
+            } else {
+                assert(expected == local.GRAY || expected == local.BLACK);
+                return;
+            }
+        }
+    }
+
+    template<typename T>
+    void Node<T>::_gc_print() const {
+        /*
+        int64_t parent_color = _gc_color.load(std::memory_order_relaxed);
+        Object* child = next.slot.load(std::memory_order_acquire);
+        if (child) {
+            int64_t child_color = child->_gc_color.load(std::memory_order_relaxed);
+            LOG("sees %p %s -> %p %s\n", this, local.color_names[parent_color], child, local.color_names[child_color]);
+        } else {
+            LOG("sees %p %s -> nullptr\n", this, local.color_names[parent_color]);
+        }
+         */
     }
 
         
@@ -494,79 +610,66 @@ namespace gch3 {
     
         Slot<Node<T>> head;
         
-        [[nodiscard]] std::size_t push(Node<T>* desired) {
-            std::size_t count = 0;
+        void push(Node<T>* desired) {
             Node<T>* expected = head.load(std::memory_order_acquire);
-            for (;;) {
-                count += desired->next.store(expected);
-                auto [flag, delta] 
-                = head.compare_exchange_strong(expected,
-                                               desired,
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_acquire);
-                count += delta;
-                if (flag)
-                    return count;
-            }
+            do {
+                desired->next.store(expected);
+            } while (!head.compare_exchange_strong(expected,
+                                                   desired,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire));
         }
         
-        [[nodiscard]] std::pair<bool, std::size_t> pop(T& victim) {
-            std::size_t count = 0;
+        bool pop(T& victim) {
             Node<T>* expected = head.load(std::memory_order_acquire);
             for (;;) {
                 if (expected == nullptr)
-                    return {false, count};
+                    return false;
                 Node<T>* desired = expected->next.load(std::memory_order_acquire);
-                auto [flag, delta]
-                = head.compare_exchange_strong(expected,
-                                               desired,
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_acquire);
-                count += delta;
+                bool flag = head.compare_exchange_strong(expected,
+                                                         desired,
+                                                         std::memory_order_acq_rel,
+                                                         std::memory_order_acquire);
                 if (flag) {
                     victim = std::move(expected->payload);
-                    expected->next.store(nullptr, std::memory_order_release);
-                    return {true, count};
+                    
+                    // TODO: we break the chain here but should fix the scanner
+                    // instead to be better
+                    
+                    expected->next.store(nullptr);
+                    
+                    
+                    
+                    return true;
                 }
             }
         }
         
-        std::size_t _gc_scan() {
-            return Object::_gc_shade(head.load(std::memory_order_acquire));
+        void _gc_scan() {
+            //LOG("scans Stack<T>\n");
+            Object::_gc_shade(head.load(std::memory_order_acquire));
         }
         
     };
 
     
     
-    
     Stack<int> global_stack;
-    
-    void hack_globals() {
-        global_stack._gc_scan();
-    }
     
     std::mutex global_integers_mutex;
     std::vector<int> global_integers;
-    
-    const char* mutator_names[3] = { "mutator0", "mutator1", "mutator2" };
-    
+        
     void mutate(const std::size_t index) {
         
-        thread_local_name = mutator_names[index];
+        char _name[5] = {' ', ' ', 'M','0','\0'};
+        _name[3] += index;
+        
+        local.name = _name;
                         
         size_t allocated = 0;
         
         std::vector<Object*> roots;
-        std::size_t dirty_count = 0;
-        std::vector<Object*> infants;
-        
-        auto allocate = [&infants]() -> Node<int>* {
-            Node<int>* infant = new Node<int>();
-            infants.push_back(infant);
-            return infant;
-        };
-        
+                
         int k = (int) index;
         std::vector<int> integers;
                         
@@ -576,68 +679,75 @@ namespace gch3 {
             
             {
                 bool pending;
-                bool collector_was_dirty = false;
                 {
                     std::unique_lock lock(channels[index].mutex);
-                    printf("Mutator %zu: locks\n", index);
                     pending = channels[index].pending;
                     if (pending) {
-                        printf("Mutator %zu: performing handshake\n", index);
+                        LOG("handshaking\n");
+                        
+                        LOG("lifetime alloc %zu\n", allocated);
+                        
+                        LOG("was WHITE=%lld BLACK=%lld ALLOC=%lld\n", local.WHITE, local.BLACK, local.ALLOC);
+                        
+                        bool flipped_ALLOC = local.ALLOC != channels[index].configuration.ALLOC;
+                        
+                        (Configuration&) local = channels[index].configuration;
+                        
+                        LOG("becomes WHITE=%lld BLACK=%lld ALLOC=%lld\n", local.WHITE, local.BLACK, local.ALLOC);
+           
+                        channels[index].dirty = local.dirty;
+                        LOG("publishing %s\n", local.dirty ? "dirty" : "clean");
+                        local.dirty = false;
 
-                        dirty_count += global_stack._gc_scan();
-                        for (Object* ref : roots)
-                            dirty_count += Object::_gc_shade(ref);
-                                               
-                        channels[index].dirty = (bool) dirty_count;
-                        printf("Mutator %zu: publishing %s\n", index, dirty_count ? "dirty" : "clean");
-                        dirty_count = 0;
-
-                        printf("Mutator %zd: publishing %zd new allocations\n", index, infants.size());
-                        assert(channels[index].objects.empty());
-                        channels[index].objects.swap(infants);
-                        assert(infants.empty());
+                        if (flipped_ALLOC) {
+                            LOG("publishing %zd new allocations\n", local.infants.size());
+                            assert(channels[index].infants.empty());
+                            channels[index].infants.swap(local.infants);
+                            assert(local.infants.empty());
+                        }
 
                         channels[index].pending = false;
-                        printf("Mutator %zu: completed handshake\n", index);
 
                     } else {
-                        printf("Mutator %zu: handshake not requested\n", index);
+                        // LOG("handshake not requested\n");
                     }
-                    printf("Mutator %zu: unlocks\n", index);
                 }
 
                 if (pending) {
-                    printf("Mutator %zu: notifies collector\n", index);
+                    LOG("notifies collector\n");
                     channels[index].condition_variable.notify_all();
                 }
             }
             
             // handshake completes
+
+            // scan the roots
+            global_stack._gc_scan();
+            for (Object* ref : roots)
+                Object::_gc_shade(ref);
+
                         
             // do some graph work
             
-            for (int i = 0; i != 10; ++i) {
+            for (int i = 0; i != 1000; ++i) {
                 
                 if (!(rand() % 2)) {
                     int j = -1;
-                    auto [flag, count] = global_stack.pop(j);
-                    dirty_count += count;
-                    if (flag) {
+                    if(global_stack.pop(j))
                         integers.push_back(j);
-                    }
                 } else {
-                    Node<int>* desired = allocate();
+                    Node<int>* desired = new Node<int>;
                     ++allocated;
                     desired->payload = k;
-                    dirty_count += global_stack.push(desired);
+                    global_stack.push(desired);
                     k += THREADS;
                 }
                 
             }
             
-            printf("Mutator %zu: WHITE -> GRAY +%zu\n", index, dirty_count);
-            
-            printf("Mutator %zu: lifetime objects allocated %zu\n", index, allocated);
+            // std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        
+            // LOG("lifetime alloc %zu\n", allocated);
 
             if (k > 100000000) {
                 std::unique_lock lock(global_integers_mutex);
