@@ -17,6 +17,8 @@
 #include <thread>
 #include <vector>
 
+#include "queue.hpp"
+
 namespace gch3 {
     
     // Base class of all garbage collected objects
@@ -64,7 +66,7 @@ namespace gch3 {
     struct Local : Configuration {
         const char* name = nullptr;
         bool dirty = false;
-        std::vector<Object*> infants;
+        Queue<Object*> infants;
     };
     
     thread_local Local local;
@@ -121,7 +123,7 @@ namespace gch3 {
         Configuration configuration;
         
         bool dirty = false;
-        std::vector<Object*> infants; // <-- objects the thread has allocated since last handshake
+        Queue<Object*> infants; // <-- objects the thread has allocated since last handshake
         
     };
     
@@ -215,7 +217,7 @@ namespace gch3 {
         size_t freed = 0;
         
         std::vector<Object*> objects;
-        std::vector<Object*> infants;
+        Queue<Object*> infants;
                         
         for (;;) {
             
@@ -261,14 +263,14 @@ namespace gch3 {
                 assert(infants.empty());
                 infants.swap(channels[i].infants);
                 lock.unlock();
-                LOG("ingesting %zu objects from %zu\n", infants.size(), i);
-                while (!infants.empty()) {
-                    Object* object = infants.back();
-                    infants.pop_back();
-                    //object->_gc_print();
-                    objects.push_back(object);
-                }
-                infants.clear();
+                LOG("ingesting objects from %zu\n", i);
+                std::size_t count = 0;
+                for (Object* object = nullptr; 
+                     infants.pop_front(object);
+                     ++count, objects.push_back(object))
+                    ;
+                LOG("ingested %zu objects from %zu\n", count, i);
+                assert(infants.empty());
             }
             
             LOG("end transition to allocating BLACK\n");
@@ -700,7 +702,7 @@ namespace gch3 {
                         local.dirty = false;
 
                         if (flipped_ALLOC) {
-                            LOG("publishing %zd new allocations\n", local.infants.size());
+                            LOG("publishing ?? new allocations\n");
                             assert(channels[index].infants.empty());
                             channels[index].infants.swap(local.infants);
                             assert(local.infants.empty());
@@ -749,7 +751,7 @@ namespace gch3 {
                         
             // LOG("lifetime alloc %zu\n", allocated);
 
-            if (k > 100000000) {
+            if (k > 10000000) {
                 std::unique_lock lock(global_integers_mutex);
                 global_integers.insert(global_integers.end(), integers.begin(), integers.end());
                 return;
