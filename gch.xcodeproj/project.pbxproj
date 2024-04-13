@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		0A62466D2BBD42F80000D163 /* main.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 0A62466C2BBD42F80000D163 /* main.cpp */; };
 		0A6246762BC517750000D163 /* queue.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 0A6246742BC517750000D163 /* queue.cpp */; };
+		0A6246792BC68FA30000D163 /* gc.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 0A6246772BC68FA30000D163 /* gc.cpp */; };
+		0A62467C2BCAA8440000D163 /* channel.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 0A62467A2BCAA8440000D163 /* channel.cpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -29,6 +31,10 @@
 		0A6246732BBFCD4C0000D163 /* dump.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = dump.txt; sourceTree = "<group>"; };
 		0A6246742BC517750000D163 /* queue.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = queue.cpp; sourceTree = "<group>"; };
 		0A6246752BC517750000D163 /* queue.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = queue.hpp; sourceTree = "<group>"; };
+		0A6246772BC68FA30000D163 /* gc.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = gc.cpp; sourceTree = "<group>"; };
+		0A6246782BC68FA30000D163 /* gc.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = gc.hpp; sourceTree = "<group>"; };
+		0A62467A2BCAA8440000D163 /* channel.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = channel.cpp; sourceTree = "<group>"; };
+		0A62467B2BCAA8440000D163 /* channel.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = channel.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -65,6 +71,10 @@
 				0A6246732BBFCD4C0000D163 /* dump.txt */,
 				0A6246742BC517750000D163 /* queue.cpp */,
 				0A6246752BC517750000D163 /* queue.hpp */,
+				0A6246772BC68FA30000D163 /* gc.cpp */,
+				0A6246782BC68FA30000D163 /* gc.hpp */,
+				0A62467A2BCAA8440000D163 /* channel.cpp */,
+				0A62467B2BCAA8440000D163 /* channel.hpp */,
 			);
 			path = gch;
 			sourceTree = "<group>";
@@ -127,7 +137,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				0A62466D2BBD42F80000D163 /* main.cpp in Sources */,
+				0A62467C2BCAA8440000D163 /* channel.cpp in Sources */,
 				0A6246762BC517750000D163 /* queue.cpp in Sources */,
+				0A6246792BC68FA30000D163 /* gc.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

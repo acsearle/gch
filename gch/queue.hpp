@@ -14,238 +14,301 @@
 #include <cstdint>
 #include <new>
 
-namespace gch3 {
-    
-    static_assert(sizeof(void*) == 8);
+namespace gc {
 
-    // A queue of machine words
+    // This deque provides true O(1) bounds on push.
+    // TODO: allocator latency spikes?
     //
+    // It does not exhibit the latency spikes of std::vector.  std::deque
+    // uses std::vector-like metadata, but it would probably be OK in practice.
     //
+    // TODO: bench gc::deque vs std::deque
     
     template<typename T>
-    struct Queue {
-        
-        static_assert(sizeof(T) == 8);
-        
-        using Z = std::intptr_t;
+    struct deque {
+                
+        struct node_type;
         
         enum {
-            WORD = 8,
             PAGE = 4096,             // <-- not necessarily a system page
-            HIGH = 0 - PAGE,
-            MID  = PAGE - WORD,
-            LOW  = WORD - 1,
-            COUNT = PAGE / WORD - 1,
+            MASK = 0 - PAGE,
+            COUNT = ((PAGE - 2 * std::max(sizeof(T), sizeof(node_type*)))
+                     / sizeof(T)),   // <-- TODO: correctness of this layout calculation?
+            INIT = COUNT / 2,
         };
         
-        struct alignas(PAGE) Node {
-            T begin[COUNT];
-            union {
-                Node* next;
-                T end[1];
-            };
+        struct alignas(PAGE) node_type {
+            
+            node_type* prev;
+            T elements[COUNT];
+            node_type* next;
+            
+            T* begin() { return elements; }
+            T* end() { return elements + COUNT; }
+            
         };
         
-        static_assert(sizeof(Node) == PAGE);
+        static_assert(sizeof(node_type) == PAGE);
+        static_assert(alignof(node_type) == PAGE);
+        static_assert(COUNT > 100);
         
-        T* _a;
-        T* _b;
-                
-        static bool _is_aligned(Node* p) {
-            return !((Z)p & MID);
-        }
+        T* _begin;
+        T* _end;
         
-        static bool _is_aligned(T* p) {
-            return !((Z)p & LOW);
-        }
-        
-        static bool _invariant(T* _a, T* _b) {
-            if (!_a != !_b)
-                return false;
-            if (!_is_aligned(_a))
-                return false;
-            if (!_is_aligned(_b))
-                return false;
-            Node* first = _node_from(_a);
-            if (!_is_aligned(first))
-                return false;
-            if (first && !(_a != first->end))
-                return false;
-            Node* last = _node_from(_b);
-            if (!_is_aligned(last))
-                return false;
-            if (first == last && !(_a <= _b))
-                return false;
-            if (!first != !last)
-                return false;
-            while (first != last) {
-                if (!first)
-                    return false;
-                first = first->next;
-            }
-            return true;
-        }
-        
-        static Node* _node_from(T* p) {
-            return (Node*) ((Z)p & HIGH);
-        }
-        
-
-        bool empty() const {
-            assert(_is_aligned(_a));
-            return _a == _b;
-        }
-        
-        void push_back(T x) {
-            if (!_b || _b == _node_from(_b)->end) {
-                Node* p = new Node;
-                if (_b)
-                    _node_from(_b)->next = p;
-                else
-                    _a = p->begin;
-                _b = p->begin;
-            }
-            *_b++ = x;
-        }
-        
-        void push_front(T x) {
-            if (_a == _node_from(_a)->_a) {
-                Node* p = new Node;
-                p->next = _a;
-                _a = p->end;
-                if (!_b)
-                    _b = _a;
-            }
-            *--_a = x;
-        }
-        
-        bool pop_front(T& victim) {
-            assert(_is_aligned(_a));
-            if (empty())
-                return false;
-            assert(_a != _node_from(_a)->end);
-            victim = *_a++;
-            if (_a == _node_from(_a)->end) {
-                if (_a != _b) {
-                    Node* d = _node_from(_a)->next;
-                    assert(_is_aligned(d));
-                    delete _node_from(_a);
-                    _a = d->begin;
-                } else {
-                    _a = _b = _node_from(_a)->begin;
-                }
-            }
-            return true;
-        }
-        
-        void _capacity_back() const {
-            return _b ? _node_from(_b).end - _b : 0;
-        }
-        
-        void _capacity_front() const {
-            return _a - _node_from(_a).begin;
+        static node_type* _node_from(T* p) {
+            return reinterpret_cast<node_type*>(reinterpret_cast<std::intptr_t>(p)
+                                           & MASK);
         }
 
-        std::size_t push_back_some(T* buffer, std::size_t count) {
-            std::size_t n = _capacity_back();
-            assert(n <= COUNT);
-            if (!n && !count) {
-                Node* p = new Node;
-                if (_b)
-                    _b->next = p;
-                else
-                    _a = p->begin;
-                _b = p->begin;
+        static const node_type* _node_from(const T* p) {
+            return reinterpret_cast<const node_type*>(reinterpret_cast<std::intptr_t>(p)
+                                                & MASK);
+        }
+        
+        void _from_null() {
+            node_type* node = new node_type;
+            node->prev = node->next = node;
+            _begin = _end = node->begin() + INIT;
+        }
+        
+        void _insert_before(node_type* node) {
+            node_type* p = new node_type;
+            p->next = node;
+            p->prev = node->prev;
+            p->next->prev = p;
+            p->prev->next = p;
+        }
+        
+        node_type* _erase(node_type* node) {
+            node->next->prev = node->prev;
+            node->prev->next = node->next;
+            node_type* after = node->next;
+            delete node;
+            return after;
+        }
+        
+        static T* _advance(T* p) {
+            node_type* node = _node_from(p);
+            assert(p != node->end());
+            ++p;
+            if (p == node->end())
+                p = node->next->begin();
+            return p;
+        }
+
+        static T* _retreat(T* p) {
+            node_type* node = _node_from(p);
+            assert(p != node->end());
+            if (p == node->begin()) {
+                p = node->prev->end();
             }
-            n = std::min(n, count);
-            std::memcpy(_b, buffer, count);
-            _b += n;
-            return n;
+            --p;
         }
-        
-        std::size_t pop_front_some(T* buffer, std::size_t count) {
-            if (!_a)
-                return 0;
-            std::size_t n;
-            if (_node_from(_a) != _node_from(_b)) {
-                 n = _node_from(_a)->end - _a;
-            } else {
-                n = _b - _a;
+
+        template<typename U>
+        struct _iterator {
+            
+            U* current;
+            
+            U& operator*() const { assert(current); return *current; }
+            U* operator->() const { assert(current); return current; }
+            
+            _iterator& operator++() {
+                current = _advance(current);
+                return *this;
             }
-            n = std::min(n, count);
-            std::memcpy(buffer, _a, n);
-            _a += n;
-            if (_a == _node_from(_a)->end) {
-                if (_a != _b) {
-                    Node* c = _node_from(_a)->next;
-                    delete _node_from(_a);
-                    _a = c->begin;
-                } else {
-                    _a = _b = _node_from(_a)->begin;
-                }
+            
+            _iterator& operator--() {
+                current = _retreat(current);
+                return *this;
             }
+            
+            _iterator operator++(int) {
+                _iterator old{current};
+                operator++();
+                return old;
+            }
+
+            _iterator operator--(int) {
+                _iterator old{current};
+                operator--();
+                return old;
+            }
+
+            bool operator!=(_iterator const&) const = default;
+            
+            template<typename V>
+            bool operator!=(_iterator<U> const& other) const {
+                return current != other.current;
+            }
+            
+        };
+        
+        using iterator = _iterator<T*>;
+        using const_iterator = _iterator<const T*>;
+                        
+        
+        
+        deque& swap(deque& other) {
+            using std::swap;
+            swap(_begin, other._begin);
+            swap(_end, other._end);
+            return other;
         }
-                
-        // basic lifetime stuff
         
-        Queue() 
-        : _a(nullptr)
-        , _b(nullptr) {
-            assert(_is_aligned(_a));
+        deque()
+        : _begin(nullptr)
+        , _end(nullptr) {
         }
         
-        Queue(const Queue&) = delete;
+        deque(const deque&) = delete;
         
-        Queue(Queue&& other)
-        : _a(std::exchange(other._a, nullptr))
-        , _b(std::exchange(other._b, nullptr)) {
-            assert(_is_aligned(_a));
+        deque(deque&& other)
+        : _begin(std::exchange(other._begin, nullptr))
+        , _end(std::exchange(other._end, nullptr)) {
         }
         
-        ~Queue() {
-            // assert(_a == _b);
-            assert(_is_aligned(_a));
-            Node* first = _node_from(_a);
-            Node* last = _node_from(_b);
+        ~deque() {
+            node_type* first = _node_from(_begin);
+            node_type* last = _node_from(_end);
             while (first != last) {
                 delete std::exchange(first, first->next);
             }
             delete first;
         }
         
-        Queue& operator=(const Queue&) = delete;
+        deque& operator=(const deque&) = delete;
         
-        Queue& swap(Queue& other) {
-            assert(_is_aligned(_a));
-            assert(_is_aligned(other._a));
-            using std::swap;
-            swap(_a, other._a);
-            swap(_b, other._b);
-            return other;
+        deque& operator=(deque&& other) {
+            return deque(std::move(other)).swap(*this);
         }
         
-        Queue& operator=(Queue&& other) {
-            assert(_is_aligned(_a));
-            assert(_is_aligned(other._a));
-            return Queue(std::move(other)).swap(*this);
+        
+        bool empty() const { return _begin == _end; }
+               
+        iterator begin() { return iterator{_begin}; }
+        const_iterator begin() const { return const_iterator{_begin}; }
+
+        iterator end() { return iterator{_end}; }
+        const_iterator end() const { return const_iterator{_end}; }
+        
+        T& front() { assert(!empty()); return *_begin; }
+        T const& front() const { assert(!empty()); return *_begin; }
+
+        T& back() {
+            assert(!empty());
+            node_type* last = _node_from(_begin);
+            T* p;
+            if (_begin != last->begin()) {
+                return *(_begin - 1);
+            } else {
+                return *(last->prev->end() - 1);
+            }
         }
         
+        void emplace_back(auto&&... args) {
+            if (!_end) { _from_null(); }
+            node_type* first = _node_from(_begin);
+            node_type* last = _node_from(_end);
+            assert(first->next->prev == first);
+            assert(last->prev->next == last);
+            assert(_end != last->end());
+            new (_end++) T(std::forward<decltype(args)>(args)...);
+            if (_end == last->end()) {
+                if (last->next == first)
+                    _insert_before(first);
+                last = last->next;
+                _end = last->begin();
+            }
+        }
+        
+        void push_back(const T& value) { return emplace_back(value); }
+        void push_back(T&& value) { return emplace_back(std::move(value)); }
+        
+        void emplace_front(auto&&... args) {
+            if (!_begin) _from_null();
+            node_type* first = _node_from(_begin);
+            node_type* last = _node_from(_end);
+            T* p;
+            assert(_begin != first->end());
+            if (_begin == first->begin()) {
+                if (first->prev == last)
+                    _insert_before(first);
+                p = first->prev->end();
+            } else {
+                p = _begin;
+            }
+            --p;
+            new (p) T(std::forward<decltype(args)>(args)...);
+            _begin = p;
+        }
+        
+        void push_front(const T& value) { return emplace_front(value); }
+        void push_front(T&& value) { return emplace_front(std::move(value)); }
+
+        void pop_front() {
+            assert(!empty());
+            std::destroy_at(_begin++);
+            node_type* first = _node_from(_begin);
+            if (_begin == first->end()) {
+                if (_begin != _end) {
+                    _begin = first->next->begin();
+                } else {
+                    _begin = _end = first->begin() + INIT;
+                }
+            }
+        }
+        
+        void pop_back() {
+            assert(!empty());
+            node_type* first = _node_from(_begin);
+            node_type* last = _node_from(_end);
+            if (_end == last->begin()) {
+                last = last->prev;
+                _end = last->end();
+            }
+            std::destroy_at(--_end);
+        }
+                
         void clear() {
-            Node* first = _node_from(_a);
-            Node* last = _node_from(_b);
+            node_type* first = _node_from(_begin);
+            node_type* last = _node_from(_end);
             while (first != last)
                 delete std::exchange(first, first->next);
-            if (last)
-                _a = _b = last->elements.begin();
+            if (first) {
+                first->next = first;
+                first->prev = first;
+                _begin = _end = first->elements.begin() + INIT;
+            }
         }
+        
+        void shrink_to_fit() {
+            if (!_end)
+                return;
+            node_type* first = _node_from(_begin);
+            node_type* last = _node_from(_end);
+            if (last->next != first->prev) {
+                // remember the first empty node
+                node_type* cursor = last->next;
+                // splice over the empty nodes
+                last->next = first;
+                first->prev = last;
+                // delete the empty nodes
+                while (cursor != first)
+                    delete std::exchange(cursor, cursor->next);
+            }
+        }
+        
         
     };
     
+    using std::swap;
+    
     template<typename T>
-    void swap(Queue<T>& r, Queue<T>& s) {
+    void swap(deque<T>& r, deque<T>& s) {
         r.swap(s);
     }
     
-}
+} // namespace gc
 
 #endif /* queue_hpp */
