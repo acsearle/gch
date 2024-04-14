@@ -76,15 +76,27 @@ namespace gc {
     inline constexpr Order RELEASE = std::memory_order_release;
     inline constexpr Order ACQ_REL = std::memory_order_acq_rel;
 
-    struct Channel;
+    struct Object;
     struct Global;
     struct Local;
-    struct Object;
+    struct Channel;
     struct ScanContext;
-
-    template<typename> struct AtomicStrong;
     template<typename> struct Strong;
+    template<typename> struct AtomicStrong;
 
+    
+    void enter();
+    void handshake();
+    void leave();
+
+    void push(Object*);
+    void pop();
+
+    void collect();
+    
+    void LOG(const char* format, ...);
+
+    
     struct Object {
         
         using Color = std::intptr_t;
@@ -102,11 +114,9 @@ namespace gc {
 
         virtual void scan(ScanContext& context) const = 0;
         virtual void cull();
-        
-        // SCAN must call SCAN on all [ATOMIC]STRONG fields
-        // CULL must call CULL on all [ATOMIC]WEAK fields
-                        
+                                
     }; // struct Object
+    
     
     template<typename T>
     struct AtomicStrong {
@@ -129,6 +139,7 @@ namespace gc {
         bool compare_exchange_weak(T*& expected, T* desired, Order success, Order failure);
         bool compare_exchange_strong(T*& expected, T* desired, Order success, Order failure);
     };
+    
     
     // Strong wraps AtomicStrong in a simpler interface that assumes that
     // only one mutator thread will freely read and write the pointer.  This
@@ -166,8 +177,6 @@ namespace gc {
         
     };
    
-
-    
     
     struct Global {
         
@@ -190,18 +199,7 @@ namespace gc {
         std::vector<Channel*> mutators_entering;
         
     };
-    
-    inline Global global;
-    
-    
-    struct Message {
-        enum {
-            NONE,
-            ENTER,
-            LEAVE,
-        } discriminant;
-        deque<Object*> objects;
-    };
+        
     
     struct Channel {
         
@@ -228,18 +226,12 @@ namespace gc {
 
     
     struct Local {
-        
-        // private
-        
         bool dirty = false;
         deque<Object*> allocations;
         std::vector<Object*> roots;
         Channel* channel = nullptr;
-                
     };
     
-    inline thread_local Local local;
-
     
     struct ScanContext {
         
@@ -273,6 +265,10 @@ namespace gc {
     };
         
     
+    
+    inline Global global;
+    inline thread_local Local local;
+
     // todo
     //
     // move Channel into Local
@@ -287,26 +283,7 @@ namespace gc {
     // with the collector, so it doesn't need...
     
     
-    
-    inline const char* _thread_name() {
-        thread_local const char* p = [](){
-            size_t n = 16;
-            char* p = (char*) operator new(n); // leaked at shutdown
-            int result = pthread_getname_np(pthread_self(), p, n);
-            assert(result != 0);
-            return p;
-        }();
-        return p;
-    };
-    
         
-#define LOG(F, ...) \
-do { \
-    char _log_pthread_getname_np_buffer_[16]; \
-    pthread_getname_np(pthread_self(), _log_pthread_getname_np_buffer_, 16); \
-    printf("%s/%c: " F, _log_pthread_getname_np_buffer_, 'c' + local.dirty  __VA_OPT__(,) __VA_ARGS__); \
-} while(false)
-
     
     
     
@@ -571,14 +548,6 @@ do { \
     // then handshaking will occur, so (as with suprious GRAY) this doesn't
     // actually matter.
     
-    void enter();
-    void handshake();
-    void leave();
-    
-    void push(Object*);
-    void pop();
-    
-    void collect();
     
 } // namespace gc
 

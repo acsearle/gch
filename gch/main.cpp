@@ -7,6 +7,7 @@
 
 
 #include <thread>
+#include <future>
 
 #include "gc.hpp"
 
@@ -14,38 +15,40 @@ namespace gc {
         
 
     template<typename T>
-    struct TrieberStack {
+    struct TrieberStack : Object {
         
-        struct Node final : Object {
-            AtomicStrong<Node> next;
-            T payload;
+        struct Node : Object {
             
-            explicit Node(auto&&... args)
-            : payload(std::forward<decltype(args)>(args)...) {
-            }
-
+            AtomicStrong<Node> next;
+            T value;
+            
             virtual ~Node() override = default;
 
             virtual void scan(ScanContext& context) const override {
                 context.push(this->next);
             }
                         
-        };
+        }; // struct Node
         
         AtomicStrong<Node> head;
         
-        void push(Node* desired) {
+        virtual void scan(ScanContext& context) const override {
+            context.push(this->head);
+        }
+        
+        void push(T value) {
+            Node* desired = new Node;
+            desired->value = std::move(value);
             Node* expected = head.load(ACQUIRE);
             do {
                 desired->next.ptr.store(expected, RELAXED);
             } while (!head.compare_exchange_strong(expected,
                                                    desired,
                                                    RELEASE,
-                                                   ACQUIRE));
-            
+                                                   ACQUIRE));            
         }
         
-        bool pop(T& victim) {
+        bool pop(T& value) {
             Node* expected = head.load(ACQUIRE);
             for (;;) {
                 if (expected == nullptr)
@@ -55,23 +58,14 @@ namespace gc {
                                                  desired,
                                                  RELAXED,
                                                  ACQUIRE)) {
-                    victim = std::move(expected->payload);
+                    value = std::move(expected->value);
                     return true;
                 }
             }
         }
-        
-        void scan(std::stack<Object*>&) {
-            //LOG("scans Stack<T>\n");
-            Object::shade(head.load(std::memory_order_acquire));
-        }
-        
+                
     };
 
-    
-    
-    TrieberStack<int> global_trieber_stack;
-    
     std::mutex global_integers_mutex;
     std::vector<int> global_integers;
     
@@ -81,32 +75,25 @@ namespace gc {
         "M0", "M1", "M2",
     };
     
-    void mutate(const std::size_t index) {
+    void mutate(TrieberStack<int>* trieber_stack,
+                const std::size_t index,
+                std::promise<std::vector<int>> result) {
         
         pthread_setname_np(mutatorNames[index]);
+        
+        push(trieber_stack);
                         
         size_t allocated = 0;
-        
-        std::vector<Object*> roots;
                 
         int k = (int) index;
         std::vector<int> integers;
     
         gc::enter();
-       
-                        
+                               
         for (;;) {
 
             gc::handshake();
-            
-            // handshake completes
-
-            // publish the roots between handshakes
-            {
-                std::stack<Object*> working;
-                global_trieber_stack.scan(working);
-            }
-                        
+                                    
             // do some graph work
             
             bool nonempty = true;
@@ -114,14 +101,11 @@ namespace gc {
                 
                 if ((k >= 10000000) || !(rand() % 2)) {
                     int j = -1;
-                    if((nonempty = global_trieber_stack.pop(j))) {
+                    if((nonempty = trieber_stack->pop(j))) {
                         integers.push_back(j);
                     }
                 } else {
-                    auto* desired = new  TrieberStack<int>::Node;
-                    ++allocated;
-                    desired->payload = k;
-                    global_trieber_stack.push(desired);
+                    trieber_stack->push(k);
                     k += THREADS;
                     nonempty = true;
                 }
@@ -131,11 +115,9 @@ namespace gc {
             // std::this_thread::sleep_for(std::chrono::milliseconds{1});
                         
             if ((k >= 10000000) && !nonempty) {
-                LOG("%p no more work to do\n", local.channel);
-                LOG("lifetime alloc %zu\n", allocated);
-                std::unique_lock lock(global_integers_mutex);
-                global_integers.insert(global_integers.end(), integers.begin(), integers.end());
-                gc::leave();
+                LOG("%p no more work to do", local.channel);
+                LOG("lifetime alloc %zu", allocated);
+                result.set_value(std::move(integers));
                 return;
             }
             
@@ -153,37 +135,57 @@ namespace gc {
     
     
     void exercise() {
-        std::thread collector(collect);
-        std::vector<std::thread> mutators;
+        
+        gc::enter();
+
+        LOG("create a concurrent stack");
+        auto p = new TrieberStack<int>;
+        gc::push(p);
+        
+        std::stack<std::future<std::vector<int>>> futures;
+        std::stack<std::thread> mutators;
         for (std::size_t i = 0; i != THREADS; ++i) {
-            mutators.emplace_back(mutate, i);
+            LOG("spawn a mutator thread");
+            std::promise<std::vector<int>> promise;
+            futures.push(promise.get_future());
+            mutators.emplace(mutate, p, i, std::move(promise));
         }
-        while (!mutators.empty()) {
-            mutators.back().join();
-            LOG("A mutator thread has terminated\n");
-            mutators.pop_back();
+        
+        gc::leave();
+
+        LOG("spawn the collector thread");
+        std::thread collector{collect};
+        
+        std::vector<int> integers;
+        while (!futures.empty()) {
+            std::vector<int> result = futures.top().get();
+            LOG("received %zu integers", result.size());
+            futures.pop();
+            integers.insert(integers.end(), result.begin(), result.end());
         }
-        LOG("All mutators terminated\n");
-        LOG("global_integers.size() = %zu\n", global_integers.size());
-        std::sort(global_integers.begin(), global_integers.end());
-        //for (int i = 0; i != 100; ++i) {
-            //printf("[%d] == %d\n", i, global_integers[i]);
-        //}
-        bool perfect = true;
-        for (int i = 0; i != global_integers.size(); ++i) {
-            if (global_integers[i] != i) {
-                LOG("The first error occurs at [%d] != %d\n", i, global_integers[i]);
-                perfect = false;
+        
+        LOG("sorting %zu results", integers.size());
+        std::sort(integers.begin(), integers.end());
+        
+        for (int i = 0;; ++i) {
+            if (i == integers.size()) {
+                LOG("all integers popped exactly once");
+                break;
+            }
+            if (i != integers[i]) {
+                LOG("first error at [%d] != %d", i, integers[i]);
                 break;
             }
         }
-        if (perfect) {
-            LOG("All integers up to %zd were popped once.\n", global_integers.size());
-        }
 
+        while (!mutators.empty()) {
+            mutators.top().join();
+            LOG("joined a mutator thread");
+            mutators.pop();
+        }
         
         collector.join();
-        LOG("Collector thread has terminated\n");
+        LOG("joined the collector thread");
     }
     
 }

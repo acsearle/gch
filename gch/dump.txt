@@ -210,26 +210,26 @@ namespace gch {
                 }
             }
         }
-        printf(" -> %zd\n", gch::count);
+        printf(" -> %zd", gch::count);
     }
     
     void collect() {
         printf("collecting %zd", gch::count);
         markFromRoots();
         sweep();
-        printf(" -> %zd\n", gch::count);
+        printf(" -> %zd", gch::count);
     }
 }
 
 
 void exercise() {
-    printf("start\n");
+    printf("start");
     gch::collect();
     for (int i = 0; i != 100; ++i) {
         gch::mutate();
         gch::collect();
     }
-    printf("clearing roots\n");
+    printf("clearing roots");
     gch::roots.clear();
     gch::collect();
 }
@@ -337,7 +337,7 @@ namespace gch2 {
             }
             
             publish(std::move(epoch));
-            printf("allocated %d\n", allocated);
+            printf("allocated %d", allocated);
         }
     }
     
@@ -440,7 +440,7 @@ namespace gch2 {
                 nodes.erase(a, c);
             }
             
-            printf("freed %d\n", freed);
+            printf("freed %d", freed);
             
             // promote
             for (Object* object : epoch.infants) {
@@ -725,10 +725,10 @@ namespace gch2 {
             labels.emplace(object, count++);
         }
 
-        printf("%zu nodes\n", nodes.size());
-        printf("%zu edges\n", edges.size());
+        printf("%zu nodes", nodes.size());
+        printf("%zu edges", edges.size());
         for (auto [a, b] : edges) {
-            printf("  (%d) -> (%d)\n", labels[a], labels[b]);
+            printf("  (%d) -> (%d)", labels[a], labels[b]);
         }
     }
     
@@ -800,7 +800,7 @@ namespace gch2 {
             }
 
             
-            printf("Total objects allocated %zd\n", allocated);
+            printf("Total objects allocated %zd", allocated);
             // do some graph work
             
             for (int i = 0; i != 100; ++i) {
@@ -921,10 +921,10 @@ namespace gch2 {
             labels.emplace(object, count++);
         }
 
-        printf("%zu nodes\n", nodes.size());
-        printf("%zu edges\n", edges.size());
+        printf("%zu nodes", nodes.size());
+        printf("%zu edges", edges.size());
         for (auto [a, b] : edges) {
-            printf("  (%d) -> (%d)\n", labels[a], labels[b]);
+            printf("  (%d) -> (%d)", labels[a], labels[b]);
         }
     }
     

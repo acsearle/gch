@@ -5,9 +5,22 @@
 //  Created by Antony Searle on 10/4/2024.
 //
 
+#include <thread>
 #include "gc.hpp"
 
 namespace gc {
+    
+    void LOG(const char* format, ...) {
+        char buffer[256];
+        pthread_getname_np(pthread_self(), buffer + 240, 16);
+        char dirty = 'c' + local.dirty;
+        int n = snprintf(buffer, 240, "%s/%c: ", buffer + 240, dirty);
+        va_list args;
+        va_start(args, format);
+        vsnprintf(buffer + n, 256 - n, format, args);
+        va_end(args);
+        puts(buffer);
+    }
     
     struct ScanContextPrivate : ScanContext {
         
@@ -32,7 +45,7 @@ namespace gc {
         
         assert(local.channel == nullptr);
         Channel* channel = local.channel = new Channel;
-        LOG("enters collectible state\n");
+        LOG("enters collectible state");
         {
             // Publish it to the collector's list of channels
             std::unique_lock lock{global.mutex};
@@ -48,7 +61,7 @@ namespace gc {
         // Look up the communication channel
         
         Channel* channel = local.channel;
-        LOG("mutator %p leaves collectible state\n", channel);
+        LOG("mutator %p leaves collectible state", channel);
         bool pending;
         {
             std::unique_lock lock(channel->mutex);
@@ -56,7 +69,7 @@ namespace gc {
             pending = std::exchange(channel->pending, false);
             channel->abandoned = true;
             channel->dirty = local.dirty;
-            LOG("publishing %s\n", local.dirty ? "dirty" : "clean");
+            LOG("publishing %s", local.dirty ? "dirty" : "clean");
             local.dirty = false;
             assert(channel->infants.empty());
             channel->infants.swap(local.allocations);
@@ -86,24 +99,24 @@ namespace gc {
             std::unique_lock lock(channel->mutex);
             pending = channel->pending;
             if (pending) {
-                LOG("handshaking\n");
+                LOG("handshaking");
                 
-                // LOG("lifetime alloc %zu\n", allocated);
+                // LOG("lifetime alloc %zu", allocated);
                 
-                // LOG("was WHITE=%lld BLACK=%lld ALLOC=%lld\n", local.WHITE, local.BLACK, local.ALLOC);
+                // LOG("was WHITE=%lld BLACK=%lld ALLOC=%lld", local.WHITE, local.BLACK, local.ALLOC);
                 
                 //bool flipped_ALLOC = local.ALLOC != channels[index].configuration.ALLOC;
                 
                 // (Configuration&) local = channels[index].configuration;
                 
-                // LOG("becomes WHITE=%lld BLACK=%lld ALLOC=%lld\n", local.WHITE, local.BLACK, local.ALLOC);
+                // LOG("becomes WHITE=%lld BLACK=%lld ALLOC=%lld", local.WHITE, local.BLACK, local.ALLOC);
                 
                 channel->dirty = local.dirty;
-                LOG("publishing %s\n", local.dirty ? "dirty" : "clean");
+                LOG("publishing %s", local.dirty ? "dirty" : "clean");
                 local.dirty = false;
                 
                 if (channel->request_infants) {
-                    LOG("publishing ?? new allocations\n");
+                    LOG("publishing ?? new allocations");
                     assert(channel->infants.empty());
                     channel->infants.swap(local.allocations);
                     assert(local.allocations.empty());
@@ -113,12 +126,12 @@ namespace gc {
                 channel->pending = false;
                 
             } else {
-                // LOG("handshake not requested\n");
+                // LOG("handshake not requested");
             }
         }
         
         if (pending) {
-            LOG("notifies collector\n");
+            LOG("notifies collector");
             channel->condition_variable.notify_all();
             for (Object* ref : local.roots)
                 Object::shade(ref);
@@ -129,7 +142,7 @@ namespace gc {
     void collect() {
         
         pthread_setname_np("C0");
-                
+                        
         size_t freed = 0;
         
         std::vector<Object*> objects;
@@ -154,8 +167,8 @@ namespace gc {
                 global.mutators_entering.clear();
                 if (!mutators.empty() || !objects.empty())
                     return;
-                LOG("collector has no work; waiting for new entrant\n");
-                LOG("lifetime freed %zu\n", freed);
+                LOG("collector has no work; waiting for new entrant");
+                LOG("lifetime freed %zu", freed);
                 global.condition_variable.wait(lock);
             }
         };
@@ -170,7 +183,7 @@ namespace gc {
         
         for (;;) {
             
-            LOG("collection begins\n");
+            LOG("collection begins");
             
             // Mutators allocate WHITE and mark GRAY
             // There are no BLACK objects
@@ -179,7 +192,7 @@ namespace gc {
             assert(global.alloc.load(std::memory_order_relaxed) == white);
             global.alloc.store(black, std::memory_order_relaxed);
             
-            LOG("begin transition to allocating BLACK\n");
+            LOG("begin transition to allocating BLACK");
             
             // handshake to ensure all mutators have seen the write to alloc
             
@@ -279,14 +292,14 @@ namespace gc {
                         assert(infants.empty());
                         infants.swap(channel->infants);
                     }
-                    LOG("ingesting objects from channel %p\n", channel);
+                    LOG("ingesting objects from channel %p", channel);
                     std::size_t count = 0;
                     while (!infants.empty()) {
                         objects.push_back(infants.front());
                         infants.pop_front();
                         ++count;
                     }
-                    LOG("ingested %zu objects from channel %p\n", count, channel);
+                    LOG("ingested %zu objects from channel %p", count, channel);
                     assert(infants.empty());
 
                 }
@@ -294,11 +307,11 @@ namespace gc {
             }
             
             
-            LOG("end transition to allocating BLACK\n");
+            LOG("end transition to allocating BLACK");
             
             for (;;) {
                 
-                //LOG("enumerating %zu known objects\n",  objects.size());
+                //LOG("enumerating %zu known objects",  objects.size());
                 //for (Object* object : objects) {
                 //    object->_gc_print();
                 //}
@@ -319,7 +332,7 @@ namespace gc {
                     std::size_t blacks = 0;
                     std::size_t grays = 0;
                     std::size_t whites = 0;
-                    LOG("scanning...\n");
+                    LOG("scanning...");
                     for (Object* object : objects) {
                         //object->_gc_print();
                         assert(object);
@@ -343,7 +356,7 @@ namespace gc {
                             abort();
                         }
                     }
-                    LOG("        ...scanning found BLACK=%zu, GRAY=%zu, WHITE=%zu\n", blacks, grays, whites);
+                    LOG("        ...scanning found BLACK=%zu, GRAY=%zu, WHITE=%zu", blacks, grays, whites);
                 } while (local.dirty);
                 
                 assert(!local.dirty);
@@ -416,7 +429,7 @@ namespace gc {
                             assert(infants.empty());
                             infants.swap(channel->infants);
                         }
-                        LOG("%p reports it was %s\n", channel, channel->dirty ? "dirty" : "clean");
+                        LOG("%p reports it was %s", channel, channel->dirty ? "dirty" : "clean");
                         if (channel->dirty) {
                             local.dirty = true;
                             channel->dirty = false;
@@ -435,7 +448,7 @@ namespace gc {
                         std::unique_lock lock{channel->mutex};
                         while (channel->pending)
                             channel->condition_variable.wait(lock);
-                        LOG("channel %p reports it was %s\n", channel, channel->dirty ? "dirty" : "clean");
+                        LOG("channel %p reports it was %s", channel, channel->dirty ? "dirty" : "clean");
                         if (channel->dirty) {
                             local.dirty = std::exchange(channel->dirty, false);
                         }
@@ -456,7 +469,7 @@ namespace gc {
             // the last handshake.  All remaining WHITE objects are unreachable.
             
             {
-                LOG("sweeping...\n");
+                LOG("sweeping...");
                 std::size_t blacks = 0;
                 std::size_t whites = 0;
                 auto first = objects.begin();
@@ -469,7 +482,7 @@ namespace gc {
                     if (color == black) {
                         ++blacks;
                         ++first;
-                        //LOG("retains %p BLACK\n", object);
+                        //LOG("retains %p BLACK", object);
                     } else if (color == white) {
                         ++whites;
                         --last;
@@ -478,17 +491,17 @@ namespace gc {
                         }
                         objects.pop_back();
                         // object->_gc_color.store(local.GREEN, std::memory_order_relaxed);
-                        //LOG("frees %p WHITE -> GREEN\n", object);
+                        //LOG("frees %p WHITE -> GREEN", object);
                         delete object;
                         ++freed;
                     } else {
-                        LOG("    ...sweeping sees %zd\n --- FATAL ---\n", color);
+                        LOG("    ...sweeping sees %zd\n --- FATAL ---", color);
                         abort();
                     }
                     
                 }
-                LOG("    ...sweeping found BLACK=%zu, WHITE=%zu\n", blacks, whites);
-                LOG("freed %zu\n", whites);
+                LOG("    ...sweeping found BLACK=%zu, WHITE=%zu", blacks, whites);
+                LOG("freed %zu", whites);
             }
             
             // Only BLACK objects exist
@@ -506,7 +519,7 @@ namespace gc {
             // Publish the reinterpretation
             for (std::size_t i = 0; i != THREADS; ++i) {
                 std::unique_lock lock(channels[i].mutex);
-                LOG("requests handshake %zu\n", i);
+                LOG("requests handshake %zu", i);
                 channels[i].pending = true;
                 // channels[i].configuration = local;
             }
@@ -556,14 +569,14 @@ namespace gc {
                 bool abandoned = false;
                 {
                     std::unique_lock lock{channel->mutex};
-                    LOG("%p reports it was %s\n", channel, channel->dirty ? "dirty" : "clean");
+                    LOG("%p reports it was %s", channel, channel->dirty ? "dirty" : "clean");
                     while (!channel->abandoned && channel->pending)
                         channel->condition_variable.wait(lock);
                     if (!channel->abandoned) {
-                        LOG("%p acknowledges recoloring\n", channel);
+                        LOG("%p acknowledges recoloring", channel);
                         assert(infants.empty());
                     } else {
-                        LOG("%p leaves\n", channel);
+                        LOG("%p leaves", channel);
                         abandoned = true;
                         assert(infants.empty());
                         infants.swap(channel->infants);
@@ -593,7 +606,7 @@ namespace gc {
                     std::unique_lock lock{channel->mutex};
                     while (channel->pending)
                         channel->condition_variable.wait(lock);
-                    LOG("%p acknowledges recoloring\n", channel);
+                    LOG("%p acknowledges recoloring", channel);
                 }
             }
              */
@@ -607,14 +620,14 @@ namespace gc {
                     = channels[i].condition_variable.wait_for(lock,
                                                               std::chrono::seconds(1));
                     if (status == std::cv_status::timeout) {
-                        LOG("timed out waiting for %zu\n --- FATAL ---\n", i);
+                        LOG("timed out waiting for %zu\n --- FATAL ---", i);
                         abort();
                     }
                 }
-                LOG("%zu acknowledges recoloring\n", i);
+                LOG("%zu acknowledges recoloring", i);
             }
             
-            LOG("collection ends\n");
+            LOG("collection ends");
              */
             
         }
