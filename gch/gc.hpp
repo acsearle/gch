@@ -8,6 +8,8 @@
 #ifndef gc_hpp
 #define gc_hpp
 
+#include <pthread/pthread.h>
+
 #include <cstdint>
 
 #include <atomic>
@@ -16,6 +18,52 @@
 #include "queue.hpp"
 
 namespace gc {
+    
+    // TODO: shared xor mutable
+    //
+    // If there are not multiple holders of  pointers to an object, GC is
+    // unncessary and conventional unique_ptr or deep copy semantics +
+    // destructors are sufficient
+    //
+    // If multiple threads hold pointers to an object, then the object must be
+    // immutable, or thread-safe.
+    //
+    // If only a single thread holds pointers to an object, then the object
+    // doesn't need to be thread-safe, but is still subject to e.g. iterator
+    // invalidation when mutation through one access point causes an unexpected
+    // change elsewhere.
+    //
+    // When concurrent collection is active, the collector thread holds a
+    // pointer to every object, so no GC object is single threaded and all must
+    // be immutable or thread safe.  The GC promises to only read^ through
+    // those pointers, and do so via the Object interface (i.e. scan).  Even
+    // this restricted access requires all mutator writes to fields that are GC
+    // pointers to have release semantics, and all collector reads to have
+    // acquire semantics.  This ensures that the allocation and initialization
+    // of the pointed-to object happen-before we dereference the pointer.
+    //
+    // This can be done by making such fields atomic, with the mutator
+    // performing relaxed loads and release stores, and the collector performing
+    // acquire loads (and no stores).  In this case, the scan method must be
+    // prepared to observe a mixture of 'new' and 'old' values of the fields,
+    // which may violate the object invariants.  This is a sort of torn read
+    // of the object body.
+    //
+    // Alternatively, the whole object can be protected by a lock to serialize
+    // access to the fields; both the mutator and collector will then always
+    // see the object in a consistent state, at the cost of interfering with
+    // each other's access.  Neither collector or mutator should hold the lock
+    // for a macroscopic time.
+    //
+    // In the common special cases leaf nodes, with no GC pointer fields, the
+    // GC does not inspect the body of the object at all.  When there is only
+    // one GC pointer field, an atomic field is strictly superior to using
+    // mutual exclusion.
+    //
+    // ^ Collector and mutator threads read and write to the .color field, even
+    // of logically immutable objects.  This is why the .color field is `mutable
+    // atomic`.
+    
     
     using Color = std::intptr_t;
     
@@ -32,6 +80,7 @@ namespace gc {
     struct Global;
     struct Local;
     struct Object;
+    struct ScanContext;
 
     template<typename> struct AtomicStrong;
     template<typename> struct Strong;
@@ -51,7 +100,7 @@ namespace gc {
         Object& operator=(Object const&) = delete;
         Object& operator=(Object&&) = delete;
 
-        virtual void scan(std::stack<Object*>&) const = 0;
+        virtual void scan(ScanContext& context) const = 0;
         virtual void cull();
         
         // SCAN must call SCAN on all [ATOMIC]STRONG fields
@@ -137,8 +186,8 @@ namespace gc {
             WEAK_UPGRADE_OCCURRED,
             WEAK_UPGRADE_PROHIBITED,
         } weak_upgrade_permission = WEAK_UPGRADE_PERMITTED;
-        
-        Channel* channels = nullptr;
+
+        std::vector<Channel*> mutators_entering;
         
     };
     
@@ -191,6 +240,37 @@ namespace gc {
     
     inline thread_local Local local;
 
+    
+    struct ScanContext {
+        
+    public:
+                
+        void push(Object const* field);
+
+        template<typename T> 
+        void push(Strong<T> const& field) {
+            push(field.ptr.load(ACQUIRE));
+        }
+        
+        template<typename T> 
+        void push(AtomicStrong<T> const& field) {
+            push(field.load(ACQUIRE));
+        }
+
+        // do these really need to be exposed to support advanced
+        // implementations of Object::scan?
+    
+        Color white() const { return _white; }
+        Color black() const { return white() ^ 2; }
+
+    protected:
+        
+        // Discourage direct use
+        
+        std::stack<Object const*> _stack;
+        Color _white;
+        
+    };
         
     
     // todo
@@ -206,8 +286,26 @@ namespace gc {
     // The Channel is only updated when the mutator is explicitly interacting
     // with the collector, so it doesn't need...
     
+    
+    
+    inline const char* _thread_name() {
+        thread_local const char* p = [](){
+            size_t n = 16;
+            char* p = (char*) operator new(n); // leaked at shutdown
+            int result = pthread_getname_np(pthread_self(), p, n);
+            assert(result != 0);
+            return p;
+        }();
+        return p;
+    };
+    
         
-#define LOG(F, ...) printf("%c: " F, 'c' + local.dirty  __VA_OPT__(,) __VA_ARGS__)
+#define LOG(F, ...) \
+do { \
+    char _log_pthread_getname_np_buffer_[16]; \
+    pthread_getname_np(pthread_self(), _log_pthread_getname_np_buffer_, 16); \
+    printf("%s/%c: " F, _log_pthread_getname_np_buffer_, 'c' + local.dirty  __VA_OPT__(,) __VA_ARGS__); \
+} while(false)
 
     
     
@@ -231,7 +329,7 @@ namespace gc {
         local.allocations.push_back(this);
     }
     
-    inline void Object::scan(std::stack<Object*>& worklist) const {
+    inline void Object::scan(ScanContext& context) const {
     }
     
     inline void Object::cull() {
@@ -367,6 +465,18 @@ namespace gc {
         return !ptr.load(RELAXED);
     }
     
+    
+    inline void ScanContext::push(Object const* object) {
+        Color expected = _white;
+        Color black = _white ^ 2;
+        if (object &&
+            object->color.compare_exchange_strong(expected,
+                                                  black,
+                                                  RELAXED,
+                                                  RELAXED)) {
+            _stack.push(object);
+        }
+    }
 
     
     

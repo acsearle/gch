@@ -12,86 +12,50 @@
 
 namespace gc {
         
-    template<typename T>
-    struct Node : Object {
-        AtomicStrong<Node> next;
-        T payload;
-        
-        virtual ~Node() override = default;
-        virtual void scan(std::stack<Object*>&) const override;
-
-        explicit Node(auto&&... args)
-        : payload(std::forward<decltype(args)>(args)...) {
-        }
-        
-    };
-    
-    template<typename T>
-    void Node<T>::scan(std::stack<Object*>& working) const {
-        // LOG("scans %p %s\n", (Object*) this, local.color_names[_gc_color.load(std::memory_order_relaxed)]);
-        
-        // Implementation A: shade child GRAY and return
-        // Object::shade(next.load(std::memory_order_acquire));
-        
-        // Implementation B:
-        // Trace white chains immediately
-        Color white = global.white.load(std::memory_order_relaxed);
-        Color black = white ^ 2;
-        const Node<T>* parent = this;
-        for (;;) {
-            Node<T>* child = parent->next.load(std::memory_order_acquire);
-            if (!child)
-                return;
-            Color expected = white;
-            // If WHITE, transform directly to BLACK and trace into that node
-            if (child->color.compare_exchange_strong(expected,
-                                                     black,
-                                                     std::memory_order_relaxed,
-                                                     std::memory_order_relaxed)) {
-                local.dirty = true;
-                parent = child;
-            } else {
-                // assert(expected == local.GRAY || expected == local.BLACK);
-                return;
-            }
-        }
-    }
 
     template<typename T>
     struct TrieberStack {
-    
-        AtomicStrong<Node<T>> head;
         
-        void push(Node<T>* desired) {
-            Node<T>* expected = head.load(std::memory_order_acquire);
+        struct Node final : Object {
+            AtomicStrong<Node> next;
+            T payload;
+            
+            explicit Node(auto&&... args)
+            : payload(std::forward<decltype(args)>(args)...) {
+            }
+
+            virtual ~Node() override = default;
+
+            virtual void scan(ScanContext& context) const override {
+                context.push(this->next);
+            }
+                        
+        };
+        
+        AtomicStrong<Node> head;
+        
+        void push(Node* desired) {
+            Node* expected = head.load(ACQUIRE);
             do {
-                desired->next.store(expected, std::memory_order_release);
+                desired->next.ptr.store(expected, RELAXED);
             } while (!head.compare_exchange_strong(expected,
                                                    desired,
-                                                   std::memory_order_acq_rel,
-                                                   std::memory_order_acquire));
+                                                   RELEASE,
+                                                   ACQUIRE));
+            
         }
         
         bool pop(T& victim) {
-            Node<T>* expected = head.load(std::memory_order_acquire);
+            Node* expected = head.load(ACQUIRE);
             for (;;) {
                 if (expected == nullptr)
                     return false;
-                Node<T>* desired = expected->next.load(std::memory_order_acquire);
-                bool flag = head.compare_exchange_strong(expected,
-                                                         desired,
-                                                         std::memory_order_acq_rel,
-                                                         std::memory_order_acquire);
-                if (flag) {
+                Node* desired = expected->next.load(RELAXED);
+                if (head.compare_exchange_strong(expected,
+                                                 desired,
+                                                 RELAXED,
+                                                 ACQUIRE)) {
                     victim = std::move(expected->payload);
-                    
-                    // TODO: we break the chain here but should fix the scanner
-                    // instead to be better
-                    
-                    // expected->next.store(nullptr, RELEASE);
-                    
-                    
-                    
                     return true;
                 }
             }
@@ -112,8 +76,14 @@ namespace gc {
     std::vector<int> global_integers;
     
     constexpr std::size_t THREADS = 3;
-        
+
+    const char* mutatorNames[THREADS] = {
+        "M0", "M1", "M2",
+    };
+    
     void mutate(const std::size_t index) {
+        
+        pthread_setname_np(mutatorNames[index]);
                         
         size_t allocated = 0;
         
@@ -139,27 +109,30 @@ namespace gc {
                         
             // do some graph work
             
+            bool nonempty = true;
             for (int i = 0; i != 1000; ++i) {
                 
-                if (!(rand() % 2)) {
+                if ((k >= 10000000) || !(rand() % 2)) {
                     int j = -1;
-                    if(global_trieber_stack.pop(j))
+                    if((nonempty = global_trieber_stack.pop(j))) {
                         integers.push_back(j);
+                    }
                 } else {
-                    Node<int>* desired = new Node<int>;
+                    auto* desired = new  TrieberStack<int>::Node;
                     ++allocated;
                     desired->payload = k;
                     global_trieber_stack.push(desired);
                     k += THREADS;
+                    nonempty = true;
                 }
                 
             }
             
             // std::this_thread::sleep_for(std::chrono::milliseconds{1});
                         
-            LOG("lifetime alloc %zu\n", allocated);
-
-            if (k > 10000000) {
+            if ((k >= 10000000) && !nonempty) {
+                LOG("%p no more work to do\n", local.channel);
+                LOG("lifetime alloc %zu\n", allocated);
                 std::unique_lock lock(global_integers_mutex);
                 global_integers.insert(global_integers.end(), integers.begin(), integers.end());
                 gc::leave();
@@ -187,27 +160,36 @@ namespace gc {
         }
         while (!mutators.empty()) {
             mutators.back().join();
+            LOG("A mutator thread has terminated\n");
             mutators.pop_back();
         }
-        printf("global_integers.size() = %zu\n", global_integers.size());
+        LOG("All mutators terminated\n");
+        LOG("global_integers.size() = %zu\n", global_integers.size());
         std::sort(global_integers.begin(), global_integers.end());
         //for (int i = 0; i != 100; ++i) {
             //printf("[%d] == %d\n", i, global_integers[i]);
         //}
+        bool perfect = true;
         for (int i = 0; i != global_integers.size(); ++i) {
             if (global_integers[i] != i) {
-                printf("The first missing integer is %d\n", i);
+                LOG("The first error occurs at [%d] != %d\n", i, global_integers[i]);
+                perfect = false;
                 break;
             }
+        }
+        if (perfect) {
+            LOG("All integers up to %zd were popped once.\n", global_integers.size());
         }
 
         
         collector.join();
+        LOG("Collector thread has terminated\n");
     }
     
 }
 
 int main(int argc, const char * argv[]) {
+    pthread_setname_np("MAIN");
     srand(79);
     gc::exercise();
 }
