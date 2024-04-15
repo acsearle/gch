@@ -88,9 +88,9 @@ namespace gc {
     void enter();
     void handshake();
     void leave();
-
-    void push(Object*);
-    void pop();
+    
+    // local.roots.push(Object*)
+    // local.roots.pop()
 
     void collect();
     
@@ -196,16 +196,12 @@ namespace gc {
             WEAK_UPGRADE_PROHIBITED,
         } weak_upgrade_permission = WEAK_UPGRADE_PERMITTED;
 
-        std::vector<Channel*> mutators_entering;
+        std::vector<Channel*> entrants;
         
     };
         
     
     struct Channel {
-        
-        // linked list pointers are protected by global.mutex
-        
-        Channel* next;
         
         // data is protected by self.mutex
         
@@ -228,7 +224,7 @@ namespace gc {
     struct Local {
         bool dirty = false;
         deque<Object*> allocations;
-        std::vector<Object*> roots;
+        deque<Object*> roots;
         Channel* channel = nullptr;
     };
     
@@ -303,6 +299,7 @@ namespace gc {
     
     inline Object::Object()
     : color(global.alloc.load(RELAXED)) {
+        assert(local.channel); // <-- catch allocations that are not inside a mutator
         local.allocations.push_back(this);
     }
     
@@ -314,8 +311,12 @@ namespace gc {
     
     
     
+    template<typename T>
+    AtomicStrong<T>::AtomicStrong(T* desired)
+    : ptr(desired) {        
+    }
     
-    template<typename T> 
+    template<typename T>
     T* AtomicStrong<T>::load(Order order) const {
         return ptr.load(order);
     }

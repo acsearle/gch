@@ -11,53 +11,55 @@
 
 #include "gc.hpp"
 
-namespace gc {
+namespace usr {
+    
+    using gc::LOG;
         
 
     template<typename T>
-    struct TrieberStack : Object {
+    struct TrieberStack : gc::Object {
         
-        struct Node : Object {
+        struct Node : gc::Object {
             
-            AtomicStrong<Node> next;
+            gc::AtomicStrong<Node> next;
             T value;
             
             virtual ~Node() override = default;
 
-            virtual void scan(ScanContext& context) const override {
+            virtual void scan(gc::ScanContext& context) const override {
                 context.push(this->next);
             }
                         
         }; // struct Node
         
-        AtomicStrong<Node> head;
+        gc::AtomicStrong<Node> head;
         
-        virtual void scan(ScanContext& context) const override {
+        virtual void scan(gc::ScanContext& context) const override {
             context.push(this->head);
         }
         
         void push(T value) {
             Node* desired = new Node;
             desired->value = std::move(value);
-            Node* expected = head.load(ACQUIRE);
+            Node* expected = head.load(gc::ACQUIRE);
             do {
-                desired->next.ptr.store(expected, RELAXED);
+                desired->next.ptr.store(expected, gc::RELAXED);
             } while (!head.compare_exchange_strong(expected,
                                                    desired,
-                                                   RELEASE,
-                                                   ACQUIRE));            
+                                                   gc::RELEASE,
+                                                   gc::ACQUIRE));
         }
         
         bool pop(T& value) {
-            Node* expected = head.load(ACQUIRE);
+            Node* expected = head.load(gc::ACQUIRE);
             for (;;) {
                 if (expected == nullptr)
                     return false;
-                Node* desired = expected->next.load(RELAXED);
+                Node* desired = expected->next.load(gc::RELAXED);
                 if (head.compare_exchange_strong(expected,
                                                  desired,
-                                                 RELAXED,
-                                                 ACQUIRE)) {
+                                                 gc::RELAXED,
+                                                 gc::ACQUIRE)) {
                     value = std::move(expected->value);
                     return true;
                 }
@@ -65,30 +67,110 @@ namespace gc {
         }
                 
     };
-
-    std::mutex global_integers_mutex;
-    std::vector<int> global_integers;
     
-    constexpr std::size_t THREADS = 3;
+    
+    template<typename T>
+    struct MichaelScottQueue : gc::Object {
+        
+        struct Node : gc::Object {
+            
+            gc::AtomicStrong<Node> next;
+            T value;
+            
+            virtual ~Node() override = default;
+            
+            virtual void scan(gc::ScanContext& context) const override {
+                context.push(this->next);
+            }
+            
+        }; // struct Node
+        
+        gc::AtomicStrong<Node> head;
+        gc::AtomicStrong<Node> tail;
+        
+        MichaelScottQueue() : MichaelScottQueue(new Node) {} // <-- default constructible T
+        MichaelScottQueue(const MichaelScottQueue&) = delete;
+        MichaelScottQueue(MichaelScottQueue&&) = delete;
+        virtual ~MichaelScottQueue() = default;
+        MichaelScottQueue& operator=(const MichaelScottQueue&) = delete;
+        MichaelScottQueue& operator=(MichaelScottQueue&&) = delete;
 
-    const char* mutatorNames[THREADS] = {
-        "M0", "M1", "M2",
+        explicit MichaelScottQueue(Node* sentinel)
+        : head(sentinel)
+        , tail(sentinel) {
+        }
+        
+        virtual void scan(gc::ScanContext& context) const override {
+            context.push(this->head);
+        }
+        
+        
+        
+        void push(T value) {
+            // Make new node
+            Node* a = new Node;
+            assert(a);
+            a->value = std::move(value);
+
+            // Load the tail
+            Node* b = tail.load(gc::ACQUIRE);
+            for (;;) {
+                assert(b);
+                // If tail->next is null, install the new node
+                Node* next = nullptr;
+                if (b->next.compare_exchange_strong(next, a, gc::RELEASE, gc::ACQUIRE))
+                    return;
+                assert(next);
+                // tail is lagging, advance it to the next value
+                if (tail.compare_exchange_strong(b, next, gc::RELEASE, gc::ACQUIRE))
+                    b = next;
+                // Either way, b is now our last observation of tail
+            }
+        }
+        
+        bool pop(T& value) {
+            Node* expected = head.load(gc::ACQUIRE);
+            for (;;) {
+                assert(expected);
+                Node* next = expected->next.load(gc::ACQUIRE);
+                if (next == nullptr)
+                    // The queue contains only the sentinel node
+                    return false;
+                if (head.compare_exchange_strong(expected, next, gc::RELEASE, gc::ACQUIRE)) {
+                    // We moved head forward
+                    value = std::move(next->value);
+                    return true;
+                }
+                // Else we loaded an unexpected value for head, try again
+            }
+        }
     };
     
-    void mutate(TrieberStack<int>* trieber_stack,
+    
+    constexpr std::size_t THREADS = 3;
+    constexpr std::size_t PUSHES = 10000000;
+
+    void mutate(// TrieberStack<int>* trieber_stack,
+                MichaelScottQueue<int>* michael_scott_queue,
                 const std::size_t index,
                 std::promise<std::vector<int>> result) {
-        
-        pthread_setname_np(mutatorNames[index]);
-        
-        push(trieber_stack);
+    
+        {
+            char name[3] = "M0";
+            name[1] += index;
+            pthread_setname_np(name);
+        }
+
+        // gc::local.roots.push_back(trieber_stack);
+        gc::local.roots.push_back(michael_scott_queue);
+
+        gc::enter();
                         
         size_t allocated = 0;
                 
         int k = (int) index;
         std::vector<int> integers;
     
-        gc::enter();
                                
         for (;;) {
 
@@ -101,68 +183,78 @@ namespace gc {
                 
                 if ((k >= 10000000) || !(rand() % 2)) {
                     int j = -1;
-                    if((nonempty = trieber_stack->pop(j))) {
+                    //if((nonempty = trieber_stack->pop(j))) {
+                    if((nonempty = michael_scott_queue->pop(j))) {
                         integers.push_back(j);
                     }
                 } else {
-                    trieber_stack->push(k);
+                    // trieber_stack->push(k);
+                    michael_scott_queue->push(k);
                     k += THREADS;
                     nonempty = true;
                 }
                 
             }
-            
-            // std::this_thread::sleep_for(std::chrono::milliseconds{1});
-                        
-            if ((k >= 10000000) && !nonempty) {
-                LOG("%p no more work to do", local.channel);
+                                    
+            if ((k >= PUSHES) && !nonempty) {
+                LOG("%p no more work to do", gc::local.channel);
                 LOG("lifetime alloc %zu", allocated);
                 result.set_value(std::move(integers));
+                gc::leave();
                 return;
             }
             
         }
     }
-    
-
-    
-    
-    
-    
-   
-    
-    
-    
-    
+        
     void exercise() {
         
         gc::enter();
 
-        LOG("create a concurrent stack");
-        auto p = new TrieberStack<int>;
-        gc::push(p);
+        LOG("creates a concurrent stack");
+        
+        LOG("spawns collector thread");
+        std::thread collector{gc::collect};
+
+        // auto p = new TrieberStack<int>; // <-- safe until we handshake or leave
+        auto p = new MichaelScottQueue<int>; // <-- safe until we handshake or leave
+        gc::local.roots.push_back(p);
         
         std::stack<std::future<std::vector<int>>> futures;
         std::stack<std::thread> mutators;
         for (std::size_t i = 0; i != THREADS; ++i) {
-            LOG("spawn a mutator thread");
+            LOG("spawns mutator thread");
             std::promise<std::vector<int>> promise;
             futures.push(promise.get_future());
             mutators.emplace(mutate, p, i, std::move(promise));
         }
-        
-        gc::leave();
 
-        LOG("spawn the collector thread");
-        std::thread collector{collect};
+        // If we leave now, the stack may be collected before the mutators
+        // start.
         
+        // TODO: Think about what it means to leave collectible state with
+        // nonempty local.roots
+        
+        // TODO: Think about global.roots.  Does the collector shade them?
+        
+        // Wait for results.  Wake up regularly to provide handshakes.  This is
+        // ugly, but I think it's just because testing forces strange patterns.
+                        
         std::vector<int> integers;
         while (!futures.empty()) {
+            while (futures.top().wait_for(std::chrono::milliseconds{20})
+                   == std::future_status::timeout)
+                gc::handshake();
             std::vector<int> result = futures.top().get();
-            LOG("received %zu integers", result.size());
             futures.pop();
+            LOG("received %zu integers", result.size());
             integers.insert(integers.end(), result.begin(), result.end());
         }
+
+        p = nullptr;
+        gc::leave();
+        
+        LOG("received %zu pops expected %zu", integers.size(), PUSHES);
         
         LOG("sorting %zu results", integers.size());
         std::sort(integers.begin(), integers.end());
@@ -193,7 +285,7 @@ namespace gc {
 int main(int argc, const char * argv[]) {
     pthread_setname_np("MAIN");
     srand(79);
-    gc::exercise();
+    usr::exercise();
 }
 
 

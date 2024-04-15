@@ -50,7 +50,7 @@ namespace gc {
             // Publish it to the collector's list of channels
             std::unique_lock lock{global.mutex};
             // channel->next = global.channels;
-            global.mutators_entering.push_back(channel);
+            global.entrants.push_back(channel);
         }
         // Wake up the mutator
         global.condition_variable.notify_all();
@@ -61,36 +61,40 @@ namespace gc {
         // Look up the communication channel
         
         Channel* channel = local.channel;
-        LOG("mutator %p leaves collectible state", channel);
+        assert(channel);
         bool pending;
         {
             std::unique_lock lock(channel->mutex);
+            LOG("leaves collectible state", channel);
             // Was there a handshake requested?
             pending = std::exchange(channel->pending, false);
             channel->abandoned = true;
             channel->dirty = local.dirty;
-            LOG("publishing %s", local.dirty ? "dirty" : "clean");
+            LOG("%spublishes %s, orphans", pending ? "handshakes, " : "", local.dirty ? "dirty" : "clean");
             local.dirty = false;
-            assert(channel->infants.empty());
-            channel->infants.swap(local.allocations);
-            assert(local.allocations.empty());
+            if (channel->infants.empty()) {
+                channel->infants.swap(local.allocations);
+                assert(local.allocations.empty());
+            } else {
+                // we are leaving after we have acknowledged a handshake, but
+                // before the collector has taken our infants
+                while (!local.allocations.empty()) {
+                    Object* p = local.allocations.front();
+                    local.allocations.pop_front();
+                    channel->infants.push_back(p);
+                }
+            }
             channel->request_infants = false;
         }
         // wake up the collector if it was already waiting on a handshake
-        if (pending)
+        if (pending) {
+            LOG("notifies collector");
             channel->condition_variable.notify_all();
+        }
         local.channel = nullptr;
         
     }
     
-    void push(Object* object) {
-        local.roots.push_back(object);
-    }
-    
-    void pop() {
-        local.roots.pop_back();
-    }
-
     
     void handshake() {
         Channel* channel = local.channel;
@@ -141,6 +145,18 @@ namespace gc {
     
     void collect() {
         
+        // TODO:
+        //
+        // is the collector thread itself a producer of allocations and holder
+        // of roots?  aka, is collecting something that a (special?) mutator
+        // thread does (sometimes?)
+        //
+        // it seems obvious that the collector should `handshake itself` in the
+        // sense of exporting its thread-local allocations to global; and if
+        // collection can be run from an entered mutator, the collector should
+        // filter itself out of handshake requirements so it doesn't wait
+        // for itself
+        
         pthread_setname_np("C0");
                         
         size_t freed = 0;
@@ -162,9 +178,11 @@ namespace gc {
             std::unique_lock lock{global.mutex};
             for (;;) {
                 mutators.insert(mutators.end(),
-                                global.mutators_entering.begin(),
-                                global.mutators_entering.end());
-                global.mutators_entering.clear();
+                                global.entrants.begin(),
+                                global.entrants.end());
+                global.entrants.clear();
+                LOG("mutators.size() -> %zu", mutators.size());
+                LOG("objects.size() -> %zu", objects.size());
                 if (!mutators.empty() || !objects.empty())
                     return;
                 LOG("collector has no work; waiting for new entrant");

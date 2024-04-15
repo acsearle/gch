@@ -15,14 +15,76 @@
 #include <new>
 
 namespace gc {
+    
+    // A double-ended queue with "true" O(1) operations.
 
-    // This deque provides true O(1) bounds on push.
-    // TODO: allocator latency spikes?
+    // Use case: mutators maintain containers of allocated objects that are
+    // periodically transferred to the mutator thread.  For this task
+    // std::vector::push_back(...) is (presumably) the fastest strategy in
+    // the throughput sense, but occasionally (1/N pushes) the container will
+    // perform an O(N) resize, causing a latency spike.  
+    
+    // To trade off latency for throughput, we can consider std::deque or
+    // std::list.
+
+    // std::list is always-worst-case with an allocation every push, but this
+    // worst case is truly O(1) (assuming the allocator is well-behaved).
+    
+    // std::deque allocates a new chunk every M elements and never moves any
+    // elements, but it does maintain a std::vector-like structure of
+    // metadata, which puts us back in the same situation above of occasional
+    // O(N/M) = O(N) moves of the metadata.  On MSVC the chunk size is
+    // notoriously too small, so this may be a real problem there.
+
+    // This deque (theoretically) provides
+    // - True O(1) push with a bounded worst case of fixed size allocation
+    //   and some pointer writes.
+    // - Same bounds as std::list
+    // - Better average performance than std::list
+    // - Same average performace as std::deque
+    // - Better bounds than std::deque
+    // The significant trade-offs are
+    // - Lose std::deque's fast indexing
+    // - Lose std::list's fast interior insert/erase
     //
-    // It does not exhibit the latency spikes of std::vector.  std::deque
-    // uses std::vector-like metadata, but it would probably be OK in practice.
+    // The implementation is a doubly linked list of arrays, akin to
+    // `std::list<std::array<T, M>>`.
     //
-    // TODO: bench gc::deque vs std::deque
+    // Each node contains a prev pointer, an array of T, and a next pointer.
+    // The nodes are power-of-two aligned.  For pointer sized objects, we
+    // can have a chunk size of 4096 bytes holding 2 8-byte pointers and 510
+    // 8-byte slots that may or may not contain a valid T.  The nodes are
+    // arranged into a circular doubly-linked list.
+    //
+    // The deque holds _begin and _end pointers to elements of the arrays of
+    // two nodes (or, the same node).  By exploiting alignment, we can
+    // construct pointers to the nodes simply by masking the low bits, and
+    // likewise when advancing or retreating pointers we can check for them
+    // falling off the array simply by checking the low bits.  This relies on
+    // implementation defined behavior (naive pointers-are-addresses) but
+    // we can fall back to explicit node pointers if required.
+    //
+    // Because the linked list is circular, a roughly-constant-sized queue being
+    // push_back and pop_front can just crawl around the buffer reusing
+    // existing space.  When a push would advance from below into the node that
+    // holds the first element, we instead insert a new node; this avoids the
+    // case when the _end pointer reaches the _begin pointer, and we have to
+    // insert the new node and some of the existing elements.
+    //
+    // When a node becomes unoccupied, we don't delete it, so
+    // the deque will have "capcity" remembering its highest occupancy, like
+    // a vector and probably like std::deque's metadata.  This avoids repeated
+    // allocation / deallocation as a stack repeatedly crosses node_bounday
+    // boundary.  `shrink_to_fit()` can be called to purge these unused nodes.
+    // An alternative strategy may be to delete unused nodes unless they are
+    // the last unused node, which we can cheaply test for (if this can be
+    // proved not to thrash under any circumstances).
+    //
+    // We have O(1) empty can have an O(1) lower bound on size, but computing
+    // the size requires O(N/M) pointer chasing, or maintaining a third field
+    // in the object.
+    //
+    // TODO: benchmark claims above
     
     template<typename T>
     struct deque {
@@ -135,17 +197,17 @@ namespace gc {
                 return old;
             }
 
-            bool operator!=(_iterator const&) const = default;
+            bool operator==(_iterator const&) const = default;
             
             template<typename V>
-            bool operator!=(_iterator<U> const& other) const {
+            bool operator==(_iterator<U> const& other) const {
                 return current != other.current;
             }
             
         };
         
-        using iterator = _iterator<T*>;
-        using const_iterator = _iterator<const T*>;
+        using iterator = _iterator<T>;
+        using const_iterator = _iterator<const T>;
                         
         
         
@@ -299,6 +361,15 @@ namespace gc {
             }
         }
         
+        std::size_t size_lower_bound() const {
+            node_type* first = _node_from(_begin);
+            node_type* last = _node_from(_end);
+            if (first == last) {
+                return _end - _begin;
+            } else {
+                return (first->end() - _begin) + (_end - last->begin());
+            }
+        }
         
     };
     
