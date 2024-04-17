@@ -6,33 +6,31 @@
 //
 
 
-#include <thread>
 #include <future>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "gc.hpp"
 
 namespace usr {
     
     using gc::LOG;
-        
 
     template<typename T>
     struct TrieberStack : gc::Object {
-        
         struct Node : gc::Object {
-            
-            gc::AtomicStrong<Node> next;
+            gc::Atomic<gc::StrongPtr<Node>> next;
             T value;
-            
             virtual ~Node() override = default;
-
             virtual void scan(gc::ScanContext& context) const override {
                 context.push(this->next);
+                context.push(this->value);
             }
-                        
         }; // struct Node
         
-        gc::AtomicStrong<Node> head;
+        gc::Atomic<gc::StrongPtr<Node>> head;
         
         virtual void scan(gc::ScanContext& context) const override {
             context.push(this->head);
@@ -66,7 +64,7 @@ namespace usr {
             }
         }
                 
-    };
+    }; // TrieberStack<T>
     
     
     template<typename T>
@@ -74,19 +72,20 @@ namespace usr {
         
         struct Node : gc::Object {
             
-            gc::AtomicStrong<Node> next;
+            gc::Atomic<gc::StrongPtr<Node>> next;
             T value;
             
             virtual ~Node() override = default;
             
             virtual void scan(gc::ScanContext& context) const override {
                 context.push(this->next);
+                context.push(this->value);
             }
             
         }; // struct Node
         
-        gc::AtomicStrong<Node> head;
-        gc::AtomicStrong<Node> tail;
+        gc::Atomic<gc::StrongPtr<Node>> head;
+        gc::Atomic<gc::StrongPtr<Node>> tail;
         
         MichaelScottQueue() : MichaelScottQueue(new Node) {} // <-- default constructible T
         MichaelScottQueue(const MichaelScottQueue&) = delete;
@@ -103,8 +102,6 @@ namespace usr {
         virtual void scan(gc::ScanContext& context) const override {
             context.push(this->head);
         }
-        
-        
         
         void push(T value) {
             // Make new node
@@ -144,7 +141,105 @@ namespace usr {
                 // Else we loaded an unexpected value for head, try again
             }
         }
+        
+    }; // MichaelScottQueue<T>
+    
+    
+    struct string_hash
+    {
+        using hash_type = std::hash<std::string_view>;
+        using is_transparent = void;
+        
+        std::size_t operator()(const char* str) const        { return hash_type{}(str); }
+        std::size_t operator()(std::string_view str) const   { return hash_type{}(str); }
+        std::size_t operator()(std::string const& str) const { return hash_type{}(str); }
     };
+
+    // String has no inner gc pointers, so it can go directly WHITE -> BLACK
+    // without making any GRAY work to delay termination
+
+    struct String : gc::Leaf {
+        
+        std::string inner;
+        
+        // weak hash map of strings
+        
+        static std::mutex mutex;
+        static std::unordered_map<std::string, String*, string_hash, std::equal_to<>> map;
+        
+        [[nodiscard]] static String* from(std::string_view v) {
+            std::unique_lock lock{mutex};
+            String*& p = map[std::string(v)];
+            if (p) {
+                gc::shade(p);
+            } else {
+                p = new String;
+                p->inner = v;
+            }
+            return p;
+        }
+        
+        virtual bool sweep(gc::SweepContext& context) override {
+            // Check for the common case of early out before we take the lock
+            // and delay the mutator
+            Color color = this->color.load(gc::RELAXED);
+            assert(color != gc::GRAY);
+            if (color == context.BLACK())
+                return false;
+            std::unique_lock lock{mutex};
+            // A WHITE String is only shaded while this lock is held, so
+            // the color test is now authoritative
+            color = this->color.load(gc::RELAXED);
+            assert(color != gc::GRAY);
+            if (color == context.BLACK())
+                return false;
+            // The String is not strong-reachable, so we sweep it
+            auto it = map.find(inner);
+            assert(it != map.end());
+            map.erase(it);
+            delete this;
+            return true;
+        }
+                
+    };
+    
+    std::mutex String::mutex;
+    std::unordered_map<std::string, String*, string_hash, std::equal_to<>> String::map;
+
+        
+    
+    /*
+    struct WeakDictionary : gc::Leaf {
+        
+        // TODO: needs to be concurrent!
+        
+        std::mutex mutex;
+        std::unordered_map<std::string, gc::WeakPtr<String>, string_hash, std::equal_to<>> inner;
+                
+        String* lookup(std::string_view key) {
+            std::unique_lock lock(mutex);
+            auto a = inner.find(key);
+            if (a == inner.end()) {
+                auto [b, c] = inner.emplace(key, nullptr);
+                assert(c);
+                assert(b != inner.end());
+                a = b;
+            }
+            String* value = a->second.try_lock();
+            if (!value) {
+                value = new String;
+                a->second = value;
+            }
+            return value;
+        }
+        
+        
+
+        
+    };
+     */
+    
+    
     
     
     constexpr std::size_t THREADS = 3;
@@ -280,12 +375,32 @@ namespace usr {
         LOG("joined the collector thread");
     }
     
+    
+    void exercise2() {
+        std::thread collector{gc::collect};
+        gc::enter();
+        {
+            for (int i = 0; i != 100; ++i) {
+                gc::handshake();
+                
+                for (int j = 0; j != 10; ++j) {
+                    char ch = (rand() % 26) + 'a';
+                    (void) String::from(std::string_view(&ch, 1));
+                }
+                
+            }
+        }
+        gc::leave();
+        collector.join();
+    }
+    
 }
 
 int main(int argc, const char * argv[]) {
     pthread_setname_np("MAIN");
     srand(79);
-    usr::exercise();
+    // usr::exercise();
+    usr::exercise2();
 }
 
 

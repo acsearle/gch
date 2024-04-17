@@ -138,10 +138,10 @@ namespace gc {
             LOG("notifies collector");
             channel->condition_variable.notify_all();
             for (Object* ref : local.roots)
-                Object::shade(ref);
+                shade(ref);
         }
     }
-
+    
     
     void collect() {
         
@@ -393,6 +393,7 @@ namespace gc {
                     head = global.channels;
                 }
                  */
+                
                 accept_entrants();
                 /*
                 for (Channel* channel = head; channel; channel = channel->next) {
@@ -402,6 +403,7 @@ namespace gc {
                 }
                  */
                 // request handshake
+                                
                 assert(mutators2.empty());
                 while (!mutators.empty()) {
                     Channel* channel = mutators.back();
@@ -476,15 +478,22 @@ namespace gc {
                  */
                 
                 
-                if (!local.dirty)
+                if (!local.dirty) {
                     break;
+                }
                 
                 local.dirty = false;
                 
             }
             
             // Neither the collectors nor mutators marked any nodes GRAY since
-            // the last handshake.  All remaining WHITE objects are unreachable.
+            // the last handshake.
+            //
+            // No weak pointers were upgraded during the handshakes.
+            //
+            // All remaining WHITE objects are unreachable.
+            //
+            // All weak_pointer upgrades will fail
             
             {
                 LOG("sweeping...");
@@ -492,31 +501,23 @@ namespace gc {
                 std::size_t whites = 0;
                 auto first = objects.begin();
                 auto last = objects.end();
+                SweepContext context;
+                context._white = white;
                 for (; first != last;) {
                     Object* object = *first;
                     assert(object);
-                    //object->_gc_print();
-                    Color color = object->color.load(std::memory_order_relaxed);
-                    if (color == black) {
-                        ++blacks;
-                        ++first;
-                        //LOG("retains %p BLACK", object);
-                    } else if (color == white) {
+                    if (object->sweep(context)) {
                         ++whites;
                         --last;
                         if (first != last) {
                             std::swap(*first, *last);
                         }
                         objects.pop_back();
-                        // object->_gc_color.store(local.GREEN, std::memory_order_relaxed);
-                        //LOG("frees %p WHITE -> GREEN", object);
-                        delete object;
                         ++freed;
                     } else {
-                        LOG("    ...sweeping sees %zd\n --- FATAL ---", color);
-                        abort();
-                    }
-                    
+                        ++blacks;
+                        ++first;
+                    }                    
                 }
                 LOG("    ...sweeping found BLACK=%zu, WHITE=%zu", blacks, whites);
                 LOG("freed %zu", whites);
