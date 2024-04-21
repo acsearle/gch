@@ -27,9 +27,9 @@ namespace gc {
     struct Ctrie : Object {
         
         enum Result {
-            RESTART,
-            OK,
-            NOTFOUND,
+            NOTFOUND = -1,
+            RESTART = 0,
+            OK = 1,
         };
         
         struct MainNode;
@@ -42,28 +42,31 @@ namespace gc {
         struct TNode;
 
         struct MainNode : Object {
-            virtual std::pair<Result, Object*> ilookupA(const INode* i, const String* k, int lev, const INode* parent) const = 0;
-            virtual std::pair<Result, Object*> iinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const = 0;
-            virtual std::pair<Result, Object*> iremoveA(const INode* i, const String* k, int lev, const INode* parent) const = 0;
-            virtual void iremoveC(const INode* i, const String* k, int lev, const INode* parent) const = 0;
-
             virtual void print() const = 0;
-            virtual const BranchNode* iresurrect(const INode* parent) const = 0;
-            virtual void iclean(int lev, const INode* parent) const = 0;
-            virtual bool icleanParent(const INode* p, const INode* i, std::size_t hc, int lev, const MainNode* m) const { return true; }
-            virtual bool icleanParent2(const INode* p, const INode* i, std::size_t hc, int lev, int pos, const CNode* cn) const { return true; }
-        };
+            virtual std::pair<Result, Object*> vlookupA(const INode* i, const String* k, int lev, const INode* parent) const = 0;
+            virtual std::pair<Result, Object*> vinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const = 0;
+            virtual std::pair<Result, Object*> vremoveA(const INode* i, const String* k, int lev, const INode* parent) const = 0;
+            virtual void vremoveC(const INode* i, const String* k, int lev, const INode* parent) const {};
+            virtual const BranchNode* vresurrectB(const INode* parent) const { return parent; };
+            virtual void vcleanA(const INode* i, int lev) const {}
+            virtual bool vcleanParentA(const INode* p, const INode* i, std::size_t hc, int lev,
+                                       const MainNode* m) const { return true; }
+            virtual bool vcleanParentB(const INode* p, const INode* i, std::size_t hc, int lev,
+                                       const MainNode* m,
+                                       const CNode* cn, std::uint64_t flag, int pos) const { return true; }
+        }; // struct MainNode
         
         struct BranchNode : Object {
-            virtual std::pair<Result, Object*> ilookupB(const INode* i, const String* k, int lev, const INode* parent) const = 0;
-            virtual std::pair<Result, Object*> iinsertB(const INode* i, const String* k, Object* v, int lev, const INode* parent,
-                                                        const CNode* cn, std::uint64_t flag, int pos) const = 0;
-            virtual std::pair<Result, Object*> iremoveB(const INode* i, const String* k, int lev, const INode* parent,
-                                                        const CNode* cn, std::uint64_t flag, int pos) const  = 0;
             virtual void print() const = 0;
-            virtual const BranchNode* iresurrect() const = 0;
-            virtual const MainNode* itoContracted(const CNode* parent) const = 0;
-        };
+            virtual std::pair<Result, Object*> vlookupB(const INode* i, const String* k, int lev, const INode* parent) const = 0;
+            virtual std::pair<Result, Object*> vinsertB(const INode* i, const String* k, Object* v, int lev, const INode* parent,
+                                                        const CNode* cn, std::uint64_t flag, int pos) const = 0;
+            virtual std::pair<Result, Object*> vremoveB(const INode* i, const String* k, int lev, const INode* parent,
+                                                        const CNode* cn, std::uint64_t flag, int pos) const  = 0;
+            virtual const BranchNode* vresurrectA() const = 0;
+            virtual const MainNode* vtoContractedB(const CNode* parent, int lev) const = 0;
+            
+        }; // struct BranchNode
         
         struct INode : BranchNode {
             
@@ -84,12 +87,12 @@ namespace gc {
                 context.push(main);
             }
             
-            std::pair<Result, Object*> ilookupB(const INode* i, const String* k, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vlookupB(const INode* i, const String* k, int lev, const INode* parent) const override {
                 const INode* sin = this;
                 return ilookup(sin, k, lev+6, i);
             }
             
-            virtual std::pair<Result, Object*> iinsertB(const INode* i, const String* k, Object* v, int lev, const INode* parent,
+            virtual std::pair<Result, Object*> vinsertB(const INode* i, const String* k, Object* v, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const override {
                 // printf("INode %p iinsert\n", this);
                 return iinsert(this, k, v, lev + 6, i);
@@ -97,20 +100,20 @@ namespace gc {
             
           
 
-            virtual std::pair<Result, Object*> iremoveB(const INode* i, const String* k, int lev, const INode* parent,
+            virtual std::pair<Result, Object*> vremoveB(const INode* i, const String* k, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const override {
                 return iremove(this, k, lev+6, i);
             }
 
-            virtual const BranchNode* iresurrect() const override {
-                return this->main.load(ACQUIRE)->iresurrect(this);
+            virtual const BranchNode* vresurrectA() const override {
+                return this->main.load(ACQUIRE)->vresurrectB(this);
             }
             
-            virtual const MainNode* itoContracted(const CNode* parent) const override {
-                return parent;
+            virtual const MainNode* vtoContractedB(const CNode* cn, int lev) const override {
+                return cn;
             }
             
-        };
+        }; // struct INode
         
         struct SNode : BranchNode {
             
@@ -132,7 +135,7 @@ namespace gc {
                 context.push(value);
             }
             
-            virtual std::pair<Result, Object*> ilookupB(const INode* i, const String* k, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vlookupB(const INode* i, const String* k, int lev, const INode* parent) const override {
                 const SNode* sn = this;
                 if (sn->key == k)
                     return std::pair(OK, value);
@@ -140,7 +143,7 @@ namespace gc {
                     return std::pair(NOTFOUND, nullptr);
             }
             
-            virtual std::pair<Result, Object*> iinsertB(const INode* i, const String* k, Object* v, int lev, const INode* parent,
+            virtual std::pair<Result, Object*> vinsertB(const INode* i, const String* k, Object* v, int lev, const INode* parent,
                                                        const CNode* cn, std::uint64_t flag, int pos) const override {
                 // printf("SNode %lx,%p iinsert with lev=%d\n", this->color.load(RELAXED), this, lev);
                 const SNode* nsn = new SNode(k, v);
@@ -164,7 +167,7 @@ namespace gc {
             
             
             
-            virtual std::pair<Result, Object*> iremoveB(const INode* i, const String* k, int lev, const INode* parent,
+            virtual std::pair<Result, Object*> vremoveB(const INode* i, const String* k, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const override {
                 if (this->key != k)
                     return std::pair(NOTFOUND, nullptr);
@@ -181,16 +184,16 @@ namespace gc {
                 }
             }
             
-            virtual const BranchNode* iresurrect() const override {
+            virtual const BranchNode* vresurrectA() const override {
                 return this;
             }
 
-            virtual const MainNode* itoContracted(const CNode* parent) const override {
-                return entomb(this);
+            virtual const MainNode* vtoContractedB(const CNode* cn, int lev) const override {
+                const SNode* sn = this;
+                return entomb(sn);
             }
-
             
-        };
+        }; // struct SNode
         
         struct TNode : MainNode {
             
@@ -205,31 +208,29 @@ namespace gc {
                 context.push(sn);
             }
             
-            virtual std::pair<Result, Object*> ilookupA(const INode* i, const String* k, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vlookupA(const INode* i, const String* k, int lev, const INode* parent) const override {
                 clean(parent, lev - 6);
                 return {RESTART, nullptr};
             }
             
-            virtual std::pair<Result, Object*> iinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const override {
                 clean(parent, lev - 6);
                 return {RESTART, nullptr};
             }
 
-            virtual std::pair<Result, Object*> iremoveA(const INode* i, const String* k, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vremoveA(const INode* i, const String* k, int lev, const INode* parent) const override {
                 clean(parent, lev - 6);
                 return {RESTART, nullptr};
             }
             
-            virtual const BranchNode* iresurrect(const INode* parent) const override {
+            virtual const BranchNode* vresurrectB(const INode* parent) const override {
                 return sn;
             }
-            
-            virtual void iclean(int lev, const INode* parent) const override {
-            }
-            
-            virtual bool icleanParent2(const INode* p, const INode* i, std::size_t hc, int lev, int pos, const CNode* cn) const override {
-                const TNode* m = this;
-                const CNode* ncn = cn->updated(pos, m->iresurrect(i));
+                                    
+            virtual bool vcleanParentB(const INode* p, const INode* i, std::size_t hc, int lev,
+                                       const MainNode* m,
+                                       const CNode* cn, std::uint64_t flag, int pos) const override {
+                const CNode* ncn = cn->updated(pos, this->sn);
                 const MainNode* expected = cn;
                 const MainNode* desired = toContracted(ncn, lev);
                 return p->main.compare_exchange_strong(expected,
@@ -238,13 +239,12 @@ namespace gc {
                                                        RELAXED);
             }
             
-            virtual void iremoveC(const INode* i, const String* k, int lev, const INode* parent) const override {
+            virtual void vremoveC(const INode* i, const String* k, int lev, const INode* parent) const override {
                 cleanParent(parent, i, k->_hash, lev - 6);
             }
-
-
             
-        };
+        }; // struct TNode
+        
         
         struct LNode : MainNode {
             const SNode* sn;
@@ -274,7 +274,7 @@ namespace gc {
                 }
             }
             
-            virtual std::pair<Result, Object*> ilookupA(const INode* i, const String* k, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vlookupA(const INode* i, const String* k, int lev, const INode* parent) const override {
                 const LNode* ln = this;
                 return ln->lookup(k);
             }
@@ -355,7 +355,7 @@ namespace gc {
             }
             
             
-            virtual std::pair<Result, Object*> iinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const override {
                 // printf("LNode %lx,%p iinsert\n", this->color.load(RELAXED), this);
                 const MainNode* expected = this;
                 if (i->main.compare_exchange_strong(expected,
@@ -368,7 +368,7 @@ namespace gc {
                 }
             }
             
-            virtual std::pair<Result, Object*> iremoveA(const INode* i, const String* k, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vremoveA(const INode* i, const String* k, int lev, const INode* parent) const override {
                 const LNode* ln = this;
                 auto [nln, v] = ln->removed(k);
                 assert(nln && nln->sn);
@@ -383,22 +383,9 @@ namespace gc {
                     return {RESTART, nullptr};
                 }
             }
-            
-            virtual void iremoveC(const INode* i, const String* k, int lev, const INode* parent) const override {
-            }
-            
-            virtual const BranchNode* iresurrect(const INode* parent) const override {
-                return parent;
-            }
-            
-            virtual void iclean(int lev, const INode* parent) const override {
-            }
-            
-            virtual bool icleanParent(const INode* p, const INode* i, std::size_t hc, int lev, const MainNode* m) const override {
-                return true;
-            }
-            
-        };
+                        
+        }; // struct LNode
+        
         
         struct CNode : MainNode {
             
@@ -521,16 +508,16 @@ namespace gc {
                 }
             }
             
-            virtual std::pair<Result, Object*> ilookupA(const INode* i, const String* k, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vlookupA(const INode* i, const String* k, int lev, const INode* parent) const override {
                 auto [flag, pos] = flagpos(k->_hash, lev, bmp);
                 if (!(flag & bmp)) {
                     return {NOTFOUND, nullptr};
                 }
                 const BranchNode* bn = array[pos];
-                return bn->ilookupB(i, k, lev, parent);
+                return bn->vlookupB(i, k, lev, parent);
             }
             
-            virtual std::pair<Result, Object*> iinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const override {
                 const CNode* cn = this;
                 auto [flag, pos] = flagpos(k->_hash, lev, cn->bmp);
                 if (!(flag & cn->bmp)) {
@@ -542,50 +529,48 @@ namespace gc {
                         return {RESTART, nullptr};
                     }
                 } else {
-                    return array[pos]->iinsertB(i, k, v, lev, parent, cn, flag, pos);
+                    return array[pos]->vinsertB(i, k, v, lev, parent, cn, flag, pos);
                 }
             }
                         
-            virtual std::pair<Result, Object*> iremoveA(const INode* i, const String* k, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> vremoveA(const INode* i, const String* k, int lev, const INode* parent) const override {
                 auto [flag, pos] = flagpos(k->_hash, lev, bmp);
                 if (!(flag & bmp)) {
                     return {NOTFOUND, nullptr};
                 }
                 const BranchNode* sub = array[pos];
                 assert(sub);
-                auto [res, value] = sub->iremoveB(i, k, lev, parent, this, flag, pos);
+                auto [res, value] = sub->vremoveB(i, k, lev, parent, this, flag, pos);
                 if (res == OK) {
-                    i->main.load(ACQUIRE)->iremoveC(i, k, lev, parent);
+                    i->main.load(ACQUIRE)->vremoveC(i, k, lev, parent);
                 }
                 return {res, value};
             }
             
-            virtual void iremoveC(const INode* i,const  String* k, int lev, const INode* parent) const override {
-            }
-
-            
-            virtual const BranchNode* iresurrect(const INode* parent) const override {
-                return parent;
-            }
-            
-            virtual void iclean(int lev, const INode* parent) const override {
-                const MainNode* expected = this;
-                const MainNode* desired = toCompressed(this, lev);
-                parent->main.compare_exchange_strong(expected, desired, RELEASE, RELAXED);
+            virtual void vcleanA(const INode* i, int lev) const override {
+                const CNode* m = this;
+                const MainNode* expected = m;
+                const MainNode* desired = toCompressed(m, lev);
+                i->main.compare_exchange_strong(expected, desired, RELEASE, RELAXED);
             }
             
-            virtual bool icleanParent(const INode* p, const INode* i, std::size_t hc, int lev, const MainNode* m) const override {
+            virtual bool vcleanParentA(const INode* p, const INode* i, std::size_t hc, int lev,
+                                       const MainNode* m) const override {
+                const CNode* cn = this;
                 auto [flag, pos] = flagpos(hc, lev, this->bmp);
                 if (!(flag & bmp))
                     return true;
                 const BranchNode* sub = this->array[pos];
                 if (sub != i)
                     return true;
-                return m->icleanParent2(p, i, hc, lev, pos, this);
+                return m->vcleanParentB(p, i, hc, lev, m, cn, flag, pos);
             }
-
-            
-        };
+                        
+        }; // struct CNode
+        
+        static const BranchNode* resurrect(const BranchNode* m) {
+            return m->vresurrectA();
+        }
                 
         static const MainNode* toCompressed(const CNode* cn, int lev) {
             int num = __builtin_popcountll(cn->bmp);
@@ -593,7 +578,7 @@ namespace gc {
             CNode* ncn = new (a) CNode;
             ncn->bmp = cn->bmp;
             for (int i = 0; i != num; ++i) {
-                ncn->array[i] = cn->array[i]->iresurrect();
+                ncn->array[i] = resurrect(cn->array[i]);
                 gc::shade(ncn->array[i]);
             }
             return toContracted(ncn, lev);
@@ -603,18 +588,18 @@ namespace gc {
             int num = __builtin_popcountll(cn->bmp);
             if (lev == 0 || num > 1)
                 return cn;
-            return cn->array[0]->itoContracted(cn);
+            return cn->array[0]->vtoContractedB(cn, lev);
         }
         
         static void clean(const INode* i, int lev) {
-            i->main.load(ACQUIRE)->iclean(lev, i);
+            i->main.load(ACQUIRE)->vcleanA(i, lev);
         }
         
         static void cleanParent(const INode* p, const INode* i, std::size_t hc, int lev) {
             for (;;) {
                 const MainNode* m = i->main.load(ACQUIRE); // <-- TODO we only redo this if it is a TNode and therefore final
-                const MainNode* pm = i->main.load(ACQUIRE); // <-- TODO get this from the failed CAS
-                if (pm->icleanParent(p, i, hc, lev, m))
+                const MainNode* pm = p->main.load(ACQUIRE); // <-- TODO get this from the failed CAS
+                if (pm->vcleanParentA(p, i, hc, lev, m))
                     return;
             }
         }
@@ -628,9 +613,7 @@ namespace gc {
         
         
         
-        
-        // TODO: The Ctrie might as well be an IndirectionNode
-        
+                
         INode* root;
         
         Ctrie()
@@ -643,17 +626,17 @@ namespace gc {
         }
         
         virtual void scan(ScanContext& context) const override {
-            // printf("scan Ctrie %p\n", this);
             context.push(root);
         }
         
         static std::pair<Result, Object*> ilookup(const INode* i, const String* k, int lev, const INode* parent) {
-            return i->main.load(ACQUIRE)->ilookupA(i, k, lev, parent);
+            return i->main.load(ACQUIRE)->vlookupA(i, k, lev, parent);
         }
         
         Object* lookup(const String* k) {
             for (;;) {
-                auto [res, v] = ilookup(root, k, 0, nullptr);
+                INode* r = root;
+                auto [res, v] = ilookup(r, k, 0, nullptr);
                 if (res == RESTART)
                     continue;
                 return v;
@@ -661,33 +644,35 @@ namespace gc {
         }
         
         static std::pair<Result, Object*> iinsert(const INode* i, const String* k, Object* v, int lev, const INode* parent) {
-            return i->main.load(ACQUIRE)->iinsertA(i, k, v, lev, parent);
+            return i->main.load(ACQUIRE)->vinsertA(i, k, v, lev, parent);
         }
         
-        void insert(const String* k, Object* v) {
+        Object* insert(const String* k, Object* v) {
             for (;;) {
-                auto [res, _] = iinsert(root, k, v, 0, nullptr);
+                INode* r = root;
+                auto [res, v2] = iinsert(r, k, v, 0, nullptr);
                 if (res == RESTART)
                     continue;
-                return;
+                return v2;
             }
         }
         
         static std::pair<Result, Object*>
         iremove(const INode* i, const String* k, int lev, const INode* parent) {
-            return i->main.load(ACQUIRE)->iremoveA(i, k, lev, parent);
+            return i->main.load(ACQUIRE)->vremoveA(i, k, lev, parent);
         }
         
         Object* remove(const String* k) {
             for (;;) {
-                auto [res, v] = iremove(root, k, 0, nullptr);
+                INode* r = root;
+                auto [res, v] = iremove(r, k, 0, nullptr);
                 if (res == RESTART)
                     continue;
                 return v;
             }
         }
         
-    }; // Ctrie
+    }; // struct Ctrie
     
 } // namespae gc
 
