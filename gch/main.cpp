@@ -340,7 +340,7 @@ namespace usr {
         auto c = new Ctrie;
         gc::local.roots.push_back(c);
         {
-            for (int i = 0; i != 100000; ++i) {
+            for (int i = 0; i != 10000; ++i) {
                 gc::handshake();
                 
                 for (int j = 0; j != 100; ++j) {

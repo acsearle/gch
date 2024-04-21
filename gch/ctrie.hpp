@@ -13,9 +13,20 @@
 
 namespace gc {
     
+    // Concurrent hash array mapped trie
+    //
+    // https://en.wikipedia.org/wiki/Ctrie
+    //
+    // Prokopec, A., Bronson N., Bagwell P., Odersky M. (2012) Concurrent Tries
+    //     with Efficient Non-Blocking Snapshots
+    
+    // A concurrent map with good worst-case performance
+    //
+    // Use case is weak set of interned strings
+    
     struct Ctrie : Object {
         
-        enum Result : intptr_t {
+        enum Result {
             RESTART,
             OK,
             NOTFOUND,
@@ -32,7 +43,7 @@ namespace gc {
 
         struct MainNode : Object {
             virtual std::pair<Result, Object*> ilookupA(const INode* i, const String* k, int lev, const INode* parent) const = 0;
-            virtual std::pair<Result, Object*> iinsert(const String* k, Object* v, int lev, const INode* parent) const = 0;
+            virtual std::pair<Result, Object*> iinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const = 0;
             virtual std::pair<Result, Object*> iremoveA(const INode* i, const String* k, int lev, const INode* parent) const = 0;
             virtual void iremoveC(const INode* i, const String* k, int lev, const INode* parent) const = 0;
 
@@ -45,8 +56,10 @@ namespace gc {
         
         struct BranchNode : Object {
             virtual std::pair<Result, Object*> ilookupB(const INode* i, const String* k, int lev, const INode* parent) const = 0;
-            virtual std::pair<Result, Object*> iinsert(const String* k, Object* v, int lev, const CNode* parent, const INode* grandparent) const = 0;
-            virtual std::pair<Result, Object*> iremoveB(const INode* i, const String* k, int lev, const INode* parent, const CNode* cn, std::uint64_t flag, int pos) const  = 0;
+            virtual std::pair<Result, Object*> iinsertB(const INode* i, const String* k, Object* v, int lev, const INode* parent,
+                                                        const CNode* cn, std::uint64_t flag, int pos) const = 0;
+            virtual std::pair<Result, Object*> iremoveB(const INode* i, const String* k, int lev, const INode* parent,
+                                                        const CNode* cn, std::uint64_t flag, int pos) const  = 0;
             virtual void print() const = 0;
             virtual const BranchNode* iresurrect() const = 0;
             virtual const MainNode* itoContracted(const CNode* parent) const = 0;
@@ -76,9 +89,10 @@ namespace gc {
                 return ilookup(sin, k, lev+6, i);
             }
             
-            virtual std::pair<Result, Object*> iinsert(const String* k, Object* v, int lev, const CNode* parent, const INode* grandparent) const override {
+            virtual std::pair<Result, Object*> iinsertB(const INode* i, const String* k, Object* v, int lev, const INode* parent,
+                                                        const CNode* cn, std::uint64_t flag, int pos) const override {
                 // printf("INode %p iinsert\n", this);
-                return this->main.load(ACQUIRE)->iinsert(k, v, lev, this);
+                return iinsert(this, k, v, lev + 6, i);
             }
             
           
@@ -126,24 +140,22 @@ namespace gc {
                     return std::pair(NOTFOUND, nullptr);
             }
             
-            virtual std::pair<Result, Object*> iinsert(const String* k, Object* v, int lev, const CNode* parent,
-                                                       const INode* grandparent) const override {
+            virtual std::pair<Result, Object*> iinsertB(const INode* i, const String* k, Object* v, int lev, const INode* parent,
+                                                       const CNode* cn, std::uint64_t flag, int pos) const override {
                 // printf("SNode %lx,%p iinsert with lev=%d\n", this->color.load(RELAXED), this, lev);
-                assert(lev > 0);
-                auto [flag, pos] = CNode::flagpos(k->_hash, lev-6, parent->bmp);
+                const SNode* nsn = new SNode(k, v);
                 const CNode* ncn;
                 if (this->key != k) {
-                    const SNode* nsn = new SNode(k, v);
-                    const INode* nin = new INode(CNode::make(this, nsn, lev));
-                    ncn = parent->updated(pos, nin);
+                    const INode* nin = new INode(CNode::make(this, nsn, lev + 6));
+                    ncn = cn->updated(pos, nin);
                 } else {
-                    ncn = parent->updated(pos, new SNode(k, v));
+                    ncn = cn->updated(pos, nsn);
                 }
-                const MainNode* expected = parent;
-                if (grandparent->main.compare_exchange_strong(expected,
-                                                              ncn,
-                                                              RELEASE,
-                                                              RELAXED)) {
+                const MainNode* expected = cn;
+                if (i->main.compare_exchange_strong(expected,
+                                                    ncn,
+                                                    RELEASE,
+                                                    RELAXED)) {
                     return {OK, nullptr};
                 } else {
                     return {RESTART, nullptr};
@@ -194,17 +206,17 @@ namespace gc {
             }
             
             virtual std::pair<Result, Object*> ilookupA(const INode* i, const String* k, int lev, const INode* parent) const override {
-                clean(parent, lev-6);
+                clean(parent, lev - 6);
                 return {RESTART, nullptr};
             }
             
-            virtual std::pair<Result, Object*> iinsert(const String* k, Object* v, int lev, const INode* parent) const override {
-                clean(parent, lev-6);
+            virtual std::pair<Result, Object*> iinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const override {
+                clean(parent, lev - 6);
                 return {RESTART, nullptr};
             }
 
             virtual std::pair<Result, Object*> iremoveA(const INode* i, const String* k, int lev, const INode* parent) const override {
-                clean(parent, lev-6);
+                clean(parent, lev - 6);
                 return {RESTART, nullptr};
             }
             
@@ -343,13 +355,13 @@ namespace gc {
             }
             
             
-            virtual std::pair<Result, Object*> iinsert(const String* k, Object* v, int lev, const INode* parent) const override {
+            virtual std::pair<Result, Object*> iinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const override {
                 // printf("LNode %lx,%p iinsert\n", this->color.load(RELAXED), this);
                 const MainNode* expected = this;
-                if (parent->main.compare_exchange_strong(expected,
-                                                         inserted(k, v),
-                                                         RELEASE,
-                                                         RELAXED)) {
+                if (i->main.compare_exchange_strong(expected,
+                                                    inserted(k, v),
+                                                    RELEASE,
+                                                    RELAXED)) {
                     return {OK, nullptr};
                 } else {
                     return {RESTART, nullptr};
@@ -518,19 +530,19 @@ namespace gc {
                 return bn->ilookupB(i, k, lev, parent);
             }
             
-            virtual std::pair<Result, Object*> iinsert(const String* k, Object* v, int lev, const INode* parent) const override {
-                auto [flag, pos] = flagpos(k->_hash, lev, bmp);
-                if (!(flag & bmp)) {
+            virtual std::pair<Result, Object*> iinsertA(const INode* i, const String* k, Object* v, int lev, const INode* parent) const override {
+                const CNode* cn = this;
+                auto [flag, pos] = flagpos(k->_hash, lev, cn->bmp);
+                if (!(flag & cn->bmp)) {
                     const MainNode* expected = this;
                     const MainNode* desired = inserted(flag, pos, new SNode(k, v));
-                    if (parent->main.compare_exchange_strong(expected, desired, RELEASE, RELAXED)) {
+                    if (i->main.compare_exchange_strong(expected, desired, RELEASE, RELAXED)) {
                         return {OK, nullptr};
                     } else {
                         return {RESTART, nullptr};
                     }
                 } else {
-                    const BranchNode* sub = array[pos];
-                    return sub->iinsert(k, v, lev + 6, this, parent);
+                    return array[pos]->iinsertB(i, k, v, lev, parent, cn, flag, pos);
                 }
             }
                         
@@ -635,7 +647,7 @@ namespace gc {
             context.push(root);
         }
         
-        static std::pair<Ctrie::Result, Object*> ilookup(const INode* i, const String* k, int lev, const INode* parent) {
+        static std::pair<Result, Object*> ilookup(const INode* i, const String* k, int lev, const INode* parent) {
             return i->main.load(ACQUIRE)->ilookupA(i, k, lev, parent);
         }
         
@@ -648,16 +660,20 @@ namespace gc {
             }
         }
         
+        static std::pair<Result, Object*> iinsert(const INode* i, const String* k, Object* v, int lev, const INode* parent) {
+            return i->main.load(ACQUIRE)->iinsertA(i, k, v, lev, parent);
+        }
+        
         void insert(const String* k, Object* v) {
             for (;;) {
-                auto [res, _] = root->iinsert(k, v, 0, nullptr, nullptr);
+                auto [res, _] = iinsert(root, k, v, 0, nullptr);
                 if (res == RESTART)
                     continue;
                 return;
             }
         }
         
-        static std::pair<Ctrie::Result, Object*>
+        static std::pair<Result, Object*>
         iremove(const INode* i, const String* k, int lev, const INode* parent) {
             return i->main.load(ACQUIRE)->iremoveA(i, k, lev, parent);
         }
@@ -671,19 +687,7 @@ namespace gc {
             }
         }
         
-    };
-    
-    
-    
-    
-
-    
-    
-    
-    
-    
-    
-    
+    }; // Ctrie
     
 } // namespae gc
 

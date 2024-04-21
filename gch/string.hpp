@@ -91,7 +91,7 @@ namespace gc {
         
         [[nodiscard]] static String* from(std::string_view v) {
             std::size_t h = std::hash<std::string_view>()(v);
-            printf("\"%.*s\" -> %zx\n", (int) v.size(), v.data(), h);
+            // printf("\"%.*s\" -> %zx\n", (int) v.size(), v.data(), h);
             std::unique_lock lock{mutex};
             auto a = set.find(std::pair(v, h));
             String* b;
