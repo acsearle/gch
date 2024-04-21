@@ -220,6 +220,7 @@ namespace gc {
     struct ScanContext : CollectionContext {
         
         void push(Object const*const& field);
+        void push(Leaf const*const& field);
 
         template<typename T> 
         void push(StrongPtr<T> const& field) {
@@ -231,10 +232,7 @@ namespace gc {
             push(field.load(ACQUIRE));
         }
                 
-        template<typename T>
-        void push(T const&) {
-            // ignore non-Object fields?
-        }
+        
 
         std::stack<Object const*> _stack;
         
@@ -313,6 +311,7 @@ namespace gc {
     template<typename T>
     Atomic<StrongPtr<T>>::Atomic(T* desired)
     : ptr(desired) {
+        shade(desired);
     }
     
     template<typename T>
@@ -443,6 +442,12 @@ namespace gc {
     }
     
     
+    // WHITE OBJECT -> BLACK PUSH - we process it later
+    // GRAY OBJECT -> NOOP - we find it later in worklist
+    // BLACK OBJECT -> no need to schedule it
+    // WHITE LEAF -> BLACK NOPUSH - no need to schedule
+    // GRAY LEAF -> impossible?
+    
     inline void ScanContext::push(Object const* const& object) {
         Color expected = _white;
         Color black = _white ^ 2;
@@ -453,6 +458,16 @@ namespace gc {
                                                   RELAXED)) {
             _stack.push(object);
         }
+    }
+
+    inline void ScanContext::push(Leaf const* const& object) {
+        Color expected = _white;
+        Color black = _white ^ 2;
+        if (object)
+            object->color.compare_exchange_strong(expected,
+                                                  black,
+                                                  RELAXED,
+                                                  RELAXED);
     }
 
 } // namespace gc

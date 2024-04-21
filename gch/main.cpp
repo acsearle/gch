@@ -7,16 +7,17 @@
 
 
 #include <future>
-#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "gc.hpp"
+#include "string.hpp"
+#include "ctrie.hpp"
 
 namespace usr {
     
-    using gc::LOG;
+    using namespace gc;
 
     template<typename T>
     struct TrieberStack : gc::Object {
@@ -79,7 +80,7 @@ namespace usr {
             
             virtual void scan(gc::ScanContext& context) const override {
                 context.push(this->next);
-                context.push(this->value);
+                // context.push(this->value);
             }
             
         }; // struct Node
@@ -144,100 +145,55 @@ namespace usr {
         
     }; // MichaelScottQueue<T>
     
+   
     
-    struct string_hash
-    {
-        using hash_type = std::hash<std::string_view>;
-        using is_transparent = void;
+    struct Dictionary : gc::Object {
         
-        std::size_t operator()(const char* str) const        { return hash_type{}(str); }
-        std::size_t operator()(std::string_view str) const   { return hash_type{}(str); }
-        std::size_t operator()(std::string const& str) const { return hash_type{}(str); }
-    };
+        mutable std::mutex mutex;
+        std::unordered_map<String*, gc::Object*, typename String::Hash, typename String::KeyEqual> map;
+        
 
-    // String has no inner gc pointers, so it can go directly WHITE -> BLACK
-    // without making any GRAY work to delay termination
-
-    struct String : gc::Leaf {
-        
-        std::string inner;
-        
-        // weak hash map of strings
-        
-        static std::mutex mutex;
-        static std::unordered_map<std::string, String*, string_hash, std::equal_to<>> map;
-        
-        [[nodiscard]] static String* from(std::string_view v) {
+        // TODO: find must be fast
+        gc::Object* load(String* key) const {
             std::unique_lock lock{mutex};
-            String*& p = map[std::string(v)];
-            if (p) {
-                gc::shade(p);
+            auto it = map.find(key);
+            return it != map.end() ? it->second : nullptr;
+        }
+
+        // TODO: set must be fast-ish
+        Object* exchange(String* key, Object* value) {
+            // Write barrier requires we shade the value, any old value,
+            // and any new key
+            gc::shade(value);
+            std::unique_lock lock{mutex};
+            auto it = map.find(key);
+            if (it != map.end()) {
+                gc::shade(value);
+                Object* old = it->second;
+                gc::shade(old);
+                it->second = value;
+                return old;
             } else {
-                p = new String;
-                p->inner = v;
+                gc::shade(key);
+                map.emplace(key, value); // <-- O(N) resize
+                return nullptr;
             }
-            return p;
         }
-        
-        virtual bool sweep(gc::SweepContext& context) override {
-            // Check for the common case of early out before we take the lock
-            // and delay the mutator
-            Color color = this->color.load(gc::RELAXED);
-            assert(color != gc::GRAY);
-            if (color == context.BLACK())
-                return false;
+
+        // scanning can be slow but it must be authoritative
+        virtual void scan(gc::ScanContext& context) const override {
             std::unique_lock lock{mutex};
-            // A WHITE String is only shaded while this lock is held, so
-            // the color test is now authoritative
-            color = this->color.load(gc::RELAXED);
-            assert(color != gc::GRAY);
-            if (color == context.BLACK())
-                return false;
-            // The String is not strong-reachable, so we sweep it
-            auto it = map.find(inner);
-            assert(it != map.end());
-            map.erase(it);
-            delete this;
-            return true;
-        }
-                
-    };
-    
-    std::mutex String::mutex;
-    std::unordered_map<std::string, String*, string_hash, std::equal_to<>> String::map;
-
-        
-    
-    /*
-    struct WeakDictionary : gc::Leaf {
-        
-        // TODO: needs to be concurrent!
-        
-        std::mutex mutex;
-        std::unordered_map<std::string, gc::WeakPtr<String>, string_hash, std::equal_to<>> inner;
-                
-        String* lookup(std::string_view key) {
-            std::unique_lock lock(mutex);
-            auto a = inner.find(key);
-            if (a == inner.end()) {
-                auto [b, c] = inner.emplace(key, nullptr);
-                assert(c);
-                assert(b != inner.end());
-                a = b;
+            for (const auto& kv : map) { // <-- O(N) iteration
+                context.push(kv.first);
+                context.push(kv.second);
             }
-            String* value = a->second.try_lock();
-            if (!value) {
-                value = new String;
-                a->second = value;
-            }
-            return value;
         }
         
-        
-
-        
     };
-     */
+    
+    
+    
+    
     
     
     
@@ -247,6 +203,7 @@ namespace usr {
 
     void mutate(// TrieberStack<int>* trieber_stack,
                 MichaelScottQueue<int>* michael_scott_queue,
+                Ctrie* ctrie,
                 const std::size_t index,
                 std::promise<std::vector<int>> result) {
     
@@ -258,6 +215,7 @@ namespace usr {
 
         // gc::local.roots.push_back(trieber_stack);
         gc::local.roots.push_back(michael_scott_queue);
+        gc::local.roots.push_back(ctrie);
 
         gc::enter();
                         
@@ -315,18 +273,18 @@ namespace usr {
         auto p = new MichaelScottQueue<int>; // <-- safe until we handshake or leave
         gc::local.roots.push_back(p);
         
+        auto c = new Ctrie;
+        gc::local.roots.push_back(c);
+
         std::stack<std::future<std::vector<int>>> futures;
         std::stack<std::thread> mutators;
         for (std::size_t i = 0; i != THREADS; ++i) {
             LOG("spawns mutator thread");
             std::promise<std::vector<int>> promise;
             futures.push(promise.get_future());
-            mutators.emplace(mutate, p, i, std::move(promise));
+            mutators.emplace(mutate, p, c, i, std::move(promise));
         }
 
-        // If we leave now, the stack may be collected before the mutators
-        // start.
-        
         // TODO: Think about what it means to leave collectible state with
         // nonempty local.roots
         
@@ -379,13 +337,36 @@ namespace usr {
     void exercise2() {
         std::thread collector{gc::collect};
         gc::enter();
+        auto c = new Ctrie;
+        gc::local.roots.push_back(c);
         {
-            for (int i = 0; i != 100; ++i) {
+            for (int i = 0; i != 100000; ++i) {
                 gc::handshake();
                 
-                for (int j = 0; j != 10; ++j) {
-                    char ch = (rand() % 26) + 'a';
-                    (void) String::from(std::string_view(&ch, 1));
+                for (int j = 0; j != 100; ++j) {
+                    //c->print();
+                    {
+                        char ch = (rand() % 26) + 'a';
+                        String* s = String::from(std::string_view(&ch, 1));
+                        if (Object* t = c->lookup(s))
+                            assert(t == s);
+                        //c->print();
+                        c->insert(s, s);
+                        //c->print();
+                        assert(c->lookup(s) == s);
+                    }
+                    //c->print();
+                    {
+                        char ch = (rand() % 26) + 'a';
+                        String* s = String::from(std::string_view(&ch, 1));
+                        Object* t1 = c->lookup(s);
+                        assert(!t1 || (t1 == s));
+                        Object* t2 = c->remove(s);
+                        assert(t1 == t2);
+                        Object* t3 = c->lookup(s);
+                        assert(!t3);
+                    }
+
                 }
                 
             }
@@ -399,7 +380,6 @@ namespace usr {
 int main(int argc, const char * argv[]) {
     pthread_setname_np("MAIN");
     srand(79);
-    // usr::exercise();
     usr::exercise2();
 }
 
