@@ -340,31 +340,40 @@ namespace usr {
         auto c = new Ctrie;
         gc::local.roots.push_back(c);
         {
-            for (int i = 0; i != 10000; ++i) {
+            for (int i = 0; i != 1000000; ++i) {
                 gc::handshake();
                 
                 for (int j = 0; j != 100; ++j) {
-                    //c->print();
                     {
                         char ch = (rand() % 26) + 'a';
-                        String* s = String::from(std::string_view(&ch, 1));
-                        if (Object* t = c->lookup(s))
-                            assert(t == s);
-                        //c->print();
-                        c->insert(s, s);
-                        //c->print();
-                        assert(c->lookup(s) == s);
+                        _ctrie::Query q;
+                        q.view = std::string_view(&ch, 1);
+                        q.hash = std::hash<std::string_view>{}(q.view);
+                        // String* s = String::from(std::string_view(&ch, 1));
+                        printf("Doing '%c'\n", ch);
+                        auto* t1 = c->lookup(q);
+                        assert(!t1 || t1->view() == q.view);
+                        c->debug();
+                        c->emplace(q);
+                        c->debug();
+                        auto* t2 = c->lookup(q);
+                        assert(!t2 || t2->view() == q.view);
+                        assert(t2 && (!t1 || t1 == t2));
                     }
-                    //c->print();
                     {
                         char ch = (rand() % 26) + 'a';
-                        String* s = String::from(std::string_view(&ch, 1));
-                        Object* t1 = c->lookup(s);
-                        assert(!t1 || (t1 == s));
-                        Object* t2 = c->remove(s);
-                        assert(t1 == t2);
-                        Object* t3 = c->lookup(s);
-                        assert(!t3);
+                        //String* s = String::from(std::string_view(&ch, 1));
+                        _ctrie::Query q;
+                        q.view = std::string_view(&ch, 1);
+                        q.hash = std::hash<std::string_view>{}(q.view);
+                        const auto* t1 = c->lookup(q);
+                        assert(!t1 || t1->view() == q.view);
+                        if (t1) {
+                            const auto* t2 = c->remove(t1);
+                            assert(t1 == t2);
+                            const auto* t3 = c->lookup(q);
+                            assert(!t3);
+                        }
                     }
 
                 }
