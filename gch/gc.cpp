@@ -40,6 +40,11 @@ namespace gc {
     };
     
     void enter() {
+
+        assert(local.depth >= 0);
+        if (local.depth++) {
+            return;
+        }
                 
         // Create a new communication channel to the collector
         
@@ -57,6 +62,11 @@ namespace gc {
     }
     
     void leave() {
+        
+        assert(local.depth >= 0);
+        if (--local.depth) {
+            return;
+        }
         
         // Look up the communication channel
         
@@ -248,7 +258,11 @@ namespace gc {
                             adopt_infants();
                         }
                     }
-                    
+
+                    // scan the global roots
+                    for (Object* ref : global.roots)
+                        shade(ref);
+
                     // handshake ourself!
                     gc::handshake();
                     

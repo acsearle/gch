@@ -338,7 +338,7 @@ namespace usr {
         std::thread collector{gc::collect};
         gc::enter();
         global_string_ctrie = new Ctrie;
-        gc::local.roots.push_back(global_string_ctrie);
+        gc::global.roots.push_back(global_string_ctrie);
         {
             for (int i = 0; i != 100; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -363,7 +363,7 @@ namespace usr {
                         assert(t2 && (!t1 || t1 == t2));
                          */
                         std::string_view v(&ch, 1);
-                        const auto* s = _ctrie::SNode::make(v);
+                        const auto* s = _ctrie::SNode::make(_ctrie::Query(v));
                         printf("Got %p \"%.*s\"\n", s, (int) s->_size, s->_data);
                     }
                     /*

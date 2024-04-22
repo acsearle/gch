@@ -16,12 +16,22 @@ namespace gc {
     namespace _ctrie {
         
         struct Query {
-            std::size_t hash;
+            
             std::string_view view;
+            std::size_t hash;
+            
+            Query(std::string_view v, std::size_t h)
+            : view(v), hash(h) {
+                assert(h == std::hash<std::string_view>()(v));
+            }
+            
+            explicit Query(std::string_view v)
+            : Query(v, std::hash<std::string_view>()(v)) {
+            }
+            
         };
         
         enum Result {
-            NOTFOUND = -1, // TODO: We don't need NOTFOUND, just return {OK, nullptr}
             RESTART = 0,
             OK = 1,
         };
@@ -48,10 +58,6 @@ namespace gc {
             virtual const BNode* vresurrectA() const = 0;
             virtual const MNode* vtoContractedB(const CNode* parent, int lev) const = 0;
             
-            
-            virtual void maybeShade() const = 0;
-            virtual void maybeScan(ScanContext&) const = 0;
-            
         }; // struct BNode
                 
         struct SNode : BNode {
@@ -60,6 +66,8 @@ namespace gc {
                 return ::operator new(count + extra);
             }
 
+            static const SNode* make(Query q);
+            
             explicit SNode(Query);
             virtual void debug(int lev) const override;
             virtual void shade(ShadeContext&) const override;
@@ -80,12 +88,10 @@ namespace gc {
                 return std::string_view(_data, _size);
             }
             
-            virtual void maybeShade() const override;
-            virtual void maybeScan(ScanContext&) const override;
+            virtual void shade_weak(ShadeContext&) const override;
+            virtual void scan_weak(ScanContext&) const override;
             virtual bool sweep(SweepContext&) override;
-            static const SNode* make(std::string_view v);
             
-
         }; // struct SNode
                 
         
@@ -97,7 +103,6 @@ namespace gc {
             void debug();
             
             virtual void scan(ScanContext& context) const override;
-
             const SNode* lookup(Query q);
             const SNode* emplace(Query q);
             const SNode* remove(const SNode* k);

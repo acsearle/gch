@@ -86,7 +86,10 @@ namespace gc {
         virtual void shade(ShadeContext&) const;
         virtual void scan(ScanContext&) const;
         [[nodiscard]] virtual bool sweep(SweepContext&);
-        
+
+        virtual void shade_weak(ShadeContext& context) const;
+        virtual void scan_weak(ScanContext& context) const;
+
     }; // struct Object
     
     
@@ -181,6 +184,7 @@ namespace gc {
         std::condition_variable condition_variable;
         
         std::vector<Channel*> entrants;
+        deque<Object*> roots;
         
     };
         
@@ -200,6 +204,7 @@ namespace gc {
     
     // Thread local state
     struct Local {
+        int depth = 0;
         bool dirty = false;
         deque<Object*> allocations;
         deque<Object*> roots;
@@ -249,6 +254,12 @@ namespace gc {
     inline thread_local Local local;
 
 
+    inline void shade(const Object* object, ShadeContext& context) {
+        if (object) {
+            object->shade(context);
+        }
+    }
+
     inline void shade(const Object* object) {
         if (object) {
             ShadeContext context;
@@ -257,12 +268,8 @@ namespace gc {
         }
     }
     
-    inline void shade(const Object* object, ShadeContext& context) {
-        if (object) {
-            object->shade(context);
-        }
-    }
-        
+    
+    
     inline Object::Object()
     : color(global.alloc.load(RELAXED)) {
         assert(local.channel); // <-- catch allocations that are not inside a mutator
@@ -282,16 +289,25 @@ namespace gc {
     inline void Object::scan(ScanContext& context) const {
         // no-op
     }
-    
+
     inline bool Object::sweep(SweepContext& context) {
         Color color = this->color.load(RELAXED);
-        assert(color != GRAY);
         if (color == context.WHITE()) {
             delete this;
             return true;
+        } else {
+            assert(color == context.BLACK());
+            return false;
         }
-        return false;
     }
+    
+    inline void Object::shade_weak(ShadeContext& context) const {
+        this->shade(context);
+    }
+    inline void Object::scan_weak(ScanContext& context) const {
+        context.push(this);
+    }
+
         
     
     inline Leaf::Leaf() : Object() {
@@ -441,7 +457,6 @@ namespace gc {
     bool StrongPtr<T>::operator!() const {
         return !ptr.load(RELAXED);
     }
-    
     
     // WHITE OBJECT -> BLACK PUSH - we process it later
     // GRAY OBJECT -> NOOP - we find it later in worklist
