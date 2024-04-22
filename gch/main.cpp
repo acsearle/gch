@@ -337,15 +337,17 @@ namespace usr {
     void exercise2() {
         std::thread collector{gc::collect};
         gc::enter();
-        auto c = new Ctrie;
-        gc::local.roots.push_back(c);
+        global_string_ctrie = new Ctrie;
+        gc::local.roots.push_back(global_string_ctrie);
         {
-            for (int i = 0; i != 1000000; ++i) {
+            for (int i = 0; i != 100; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
                 gc::handshake();
                 
-                for (int j = 0; j != 100; ++j) {
+                for (int j = 0; j != 13; ++j) {
                     {
                         char ch = (rand() % 26) + 'a';
+                        /*
                         _ctrie::Query q;
                         q.view = std::string_view(&ch, 1);
                         q.hash = std::hash<std::string_view>{}(q.view);
@@ -359,7 +361,12 @@ namespace usr {
                         auto* t2 = c->lookup(q);
                         assert(!t2 || t2->view() == q.view);
                         assert(t2 && (!t1 || t1 == t2));
+                         */
+                        std::string_view v(&ch, 1);
+                        const auto* s = _ctrie::SNode::make(v);
+                        printf("Got %p \"%.*s\"\n", s, (int) s->_size, s->_data);
                     }
+                    /*
                     {
                         char ch = (rand() % 26) + 'a';
                         //String* s = String::from(std::string_view(&ch, 1));
@@ -375,6 +382,7 @@ namespace usr {
                             assert(!t3);
                         }
                     }
+                     */
 
                 }
                 

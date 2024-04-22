@@ -43,10 +43,15 @@ namespace gc {
             virtual std::pair<Result, const SNode*> vlookupB(const INode* i, Query q, int lev, const INode* parent) const = 0;
             virtual std::pair<Result, const SNode*> vinsertB(const INode* i, Query q, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const = 0;
-            virtual std::pair<Result, const SNode*> vremoveB(const INode* i, Query q, int lev, const INode* parent,
+            virtual std::pair<Result, const SNode*> vremoveB(const INode* i, const SNode* k, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const  = 0;
             virtual const BNode* vresurrectA() const = 0;
             virtual const MNode* vtoContractedB(const CNode* parent, int lev) const = 0;
+            
+            
+            virtual void maybeShade() const = 0;
+            virtual void maybeScan(ScanContext&) const = 0;
+            
         }; // struct BNode
                 
         struct SNode : BNode {
@@ -62,7 +67,7 @@ namespace gc {
             virtual std::pair<Result, const SNode*> vlookupB(const INode* i, Query q, int lev, const INode* parent) const override;
             virtual std::pair<Result, const SNode*> vinsertB(const INode* i, Query q, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const override;
-            virtual std::pair<Result, const SNode*> vremoveB(const INode* i, Query q, int lev, const INode* parent,
+            virtual std::pair<Result, const SNode*> vremoveB(const INode* i, const SNode* k, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const override;
             virtual const BNode* vresurrectA() const override ;
             virtual const MNode* vtoContractedB(const CNode* cn, int lev) const override;
@@ -74,6 +79,12 @@ namespace gc {
             std::string_view view() const {
                 return std::string_view(_data, _size);
             }
+            
+            virtual void maybeShade() const override;
+            virtual void maybeScan(ScanContext&) const override;
+            virtual bool sweep(SweepContext&) override;
+            static const SNode* make(std::string_view v);
+            
 
         }; // struct SNode
                 
@@ -89,7 +100,7 @@ namespace gc {
 
             const SNode* lookup(Query q);
             const SNode* emplace(Query q);
-            const SNode* remove(const SNode* q);
+            const SNode* remove(const SNode* k);
 
             INode* root;
 
@@ -98,6 +109,8 @@ namespace gc {
     } // namespace _ctrie
     
     using _ctrie::Ctrie;
+    
+    inline Ctrie* global_string_ctrie = nullptr;
     
 } // namespae gc
 

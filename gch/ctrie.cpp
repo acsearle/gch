@@ -28,7 +28,7 @@ namespace gc {
         const MNode* entomb(const SNode* sn);
         std::pair<Result, const SNode*> ilookup(const INode* i, Query q, int lev, const INode* parent);
         std::pair<Result, const SNode*> iinsert(const INode* i, Query q, int lev, const INode* parent);
-        std::pair<Result, const SNode*> iremove(const INode* i, Query q, int lev, const INode* parent);
+        std::pair<Result, const SNode*> iremove(const INode* i, const SNode* k, int lev, const INode* parent);
         const BNode* resurrect(const BNode* m);
         const MNode* toCompressed(const CNode* cn, int lev);
         const MNode* toContracted(const CNode* cn, int lev);
@@ -36,8 +36,8 @@ namespace gc {
         struct MNode : ANode {
             virtual std::pair<Result, const SNode*> vlookupA(const INode* i, Query q, int lev, const INode* parent) const = 0;
             virtual std::pair<Result, const SNode*> vinsertA(const INode* i, Query q, int lev, const INode* parent) const = 0;
-            virtual std::pair<Result, const SNode*> vremoveA(const INode* i, Query q, int lev, const INode* parent) const = 0;
-            virtual void vremoveC(const INode* i, Query q, int lev, const INode* parent) const {};
+            virtual std::pair<Result, const SNode*> vremoveA(const INode* i, const SNode* k, int lev, const INode* parent) const = 0;
+            virtual void vremoveC(const INode* i, const SNode* k, int lev, const INode* parent) const {};
             virtual const BNode* vresurrectB(const INode* parent) const;
             virtual void vcleanA(const INode* i, int lev) const {}
             virtual bool vcleanParentA(const INode* p, const INode* i, std::size_t hc, int lev,
@@ -54,10 +54,12 @@ namespace gc {
             virtual std::pair<Result, const SNode*> vlookupB(const INode* i, Query q, int lev, const INode* parent) const override;
             virtual std::pair<Result, const SNode*> vinsertB(const INode* i, Query q, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const override;
-            virtual std::pair<Result, const SNode*> vremoveB(const INode* i, Query q, int lev, const INode* parent,
+            virtual std::pair<Result, const SNode*> vremoveB(const INode* i, const SNode* k, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const override;
             virtual const BNode* vresurrectA() const override;
             virtual const MNode* vtoContractedB(const CNode* cn, int lev) const override;
+            virtual void maybeShade() const override;
+            virtual void maybeScan(ScanContext&) const override;
             mutable Atomic<StrongPtr<const MNode>> main;
         }; // struct INode
                 
@@ -66,8 +68,8 @@ namespace gc {
             virtual void scan(ScanContext& context) const override;
             virtual std::pair<Result, const SNode*> vlookupA(const INode* i, Query q, int lev, const INode* parent) const override;
             virtual std::pair<Result, const SNode*> vinsertA(const INode* i, Query q, int lev, const INode* parent) const override;
-            virtual std::pair<Result, const SNode*> vremoveA(const INode* i, Query q, int lev, const INode* parent) const override;
-            virtual void vremoveC(const INode* i, Query q, int lev, const INode* parent) const override;
+            virtual std::pair<Result, const SNode*> vremoveA(const INode* i, const SNode* k, int lev, const INode* parent) const override;
+            virtual void vremoveC(const INode* i, const SNode* k, int lev, const INode* parent) const override;
             virtual bool vcleanParentB(const INode* p, const INode* i, std::size_t hc, int lev,
                                        const MNode* m,
                                        const CNode* cn, std::uint64_t flag, int pos) const override;
@@ -121,7 +123,7 @@ namespace gc {
                         for (;;) {
                             if (b != a) {
                                 d->sn = b->sn;
-                                gc::shade(d->sn);
+                                // gc::shade(d->sn);
                                 b = b->next;
                                 LNode* e = new LNode;
                                 d->next = e;
@@ -147,8 +149,8 @@ namespace gc {
                 }
             }
             
-            std::pair<const LNode*, const SNode*> removed(Query q) const {
-                if (this->sn->view() == q.view)
+            std::pair<const LNode*, const SNode*> removed(const SNode* k) const {
+                if (this->sn == k)
                     return {this->next, this->sn};
                 const LNode* a = this->next;
                 for (;;) {
@@ -156,7 +158,7 @@ namespace gc {
                         // Not found at all
                         return {this, nullptr};
                     }
-                    if (a->sn->view() != q.view) {
+                    if (a->sn != k) {
                         // Not found yet
                         a = a->next;
                     } else {
@@ -166,7 +168,7 @@ namespace gc {
                         LNode* d = c;
                         for (;;) {
                             d->sn = b->sn; // copy over node
-                            gc::shade(d->sn);
+                            // gc::shade(d->sn);
                             b = b->next;
                             if (b == a) {
                                 // we've reached the node we are erasing, skip
@@ -197,9 +199,9 @@ namespace gc {
                 }
             }
             
-            virtual std::pair<Result, const SNode*> vremoveA(const INode* i, Query q, int lev, const INode* parent) const override {
+            virtual std::pair<Result, const SNode*> vremoveA(const INode* i, const SNode* k, int lev, const INode* parent) const override {
                 const LNode* ln = this;
-                auto [nln, v] = ln->removed(q);
+                auto [nln, v] = ln->removed(k);
                 assert(nln && nln->sn);
                 const MNode* expected = ln;
                 const MNode* desired = nln->next ? nln : entomb(nln->sn);
@@ -238,7 +240,8 @@ namespace gc {
             virtual void scan(ScanContext& context) const override {
                 int num = __builtin_popcountll(this->bmp);
                 for (int i = 0; i != num; ++i) {
-                    context.push(this->array[i]);
+                    // context.push(this->array[i]);
+                    this->array[i]->maybeScan(context);
                 }
             }
             
@@ -261,7 +264,8 @@ namespace gc {
                 b->array[pos] = child;
                 std::memcpy(b->array + pos + 1, this->array + pos, sizeof(BNode*) * (n - pos));
                 for (int i = 0; i != n + 1; ++i)
-                    gc::shade(b->array[i]);
+                    // gc::shade(b->array[i]);
+                    b->array[i]->maybeShade();
                 return b;
             }
             
@@ -274,7 +278,8 @@ namespace gc {
                 std::memcpy(b->array, this->array, sizeof(BNode*) * n);
                 b->array[pos] = child;
                 for (int i = 0; i != n; ++i)
-                    gc::shade(b->array[i]);
+                   //  gc::shade(b->array[i]);
+                    b->array[i]->maybeShade();
                 return b;
             }
             
@@ -289,7 +294,8 @@ namespace gc {
                 std::memcpy(b->array, this->array, sizeof(BNode*) * pos);
                 std::memcpy(b->array + pos, this->array + pos + 1, sizeof(BNode*) * (n - 1 - pos));
                 for (int i = 0; i != n - 1; ++i)
-                    gc::shade(b->array[i]);
+                    //  gc::shade(b->array[i]);
+                    b->array[i]->maybeShade();
                 return b;
             }
             
@@ -312,8 +318,8 @@ namespace gc {
                     int pos2 = a2 > a1;
                     c->array[pos1] = sn1;
                     c->array[pos2] = sn2;
-                    gc::shade(sn1);
-                    gc::shade(sn2);
+                    // gc::shade(sn1);
+                    // gc::shade(sn2);
                     return c;
                 } else {
                     // same hash at lev
@@ -325,11 +331,11 @@ namespace gc {
                     } else {
                         LNode* d = new LNode;
                         d->sn = sn1;
-                        gc::shade(sn1);
+                        // gc::shade(sn1);
                         d->next = nullptr;
                         LNode* e = new LNode;
                         e->sn = sn2;
-                        gc::shade(sn2);
+                        // gc::shade(sn2);
                         e->next = d;
                         c->array[0] = new INode(e);
                     }
@@ -351,9 +357,10 @@ namespace gc {
                 auto [flag, pos] = flagpos(q.hash, lev, cn->bmp);
                 if (!(flag & cn->bmp)) {
                     const MNode* expected = this;
-                    const MNode* desired = inserted(flag, pos, new (q.view.size()) SNode(q));
+                    const SNode* sn =  new (q.view.size()) SNode(q);
+                    const MNode* desired = inserted(flag, pos, sn);
                     if (i->main.compare_exchange_strong(expected, desired, RELEASE, RELAXED)) {
-                        return {OK, nullptr};
+                        return {OK, sn};
                     } else {
                         return {RESTART, nullptr};
                     }
@@ -362,16 +369,16 @@ namespace gc {
                 }
             }
             
-            virtual std::pair<Result, const SNode*> vremoveA(const INode* i, Query q, int lev, const INode* parent) const override {
-                auto [flag, pos] = flagpos(q.hash, lev, bmp);
+            virtual std::pair<Result, const SNode*> vremoveA(const INode* i, const SNode* k, int lev, const INode* parent) const override {
+                auto [flag, pos] = flagpos(k->_hash, lev, bmp);
                 if (!(flag & bmp)) {
                     return {NOTFOUND, nullptr};
                 }
                 const BNode* sub = array[pos];
                 assert(sub);
-                auto [res, value] = sub->vremoveB(i, q, lev, parent, this, flag, pos);
+                auto [res, value] = sub->vremoveB(i, k, lev, parent, this, flag, pos);
                 if (res == OK) {
-                    i->main.load(ACQUIRE)->vremoveC(i, q, lev, parent);
+                    i->main.load(ACQUIRE)->vremoveC(i, k, lev, parent);
                 }
                 return {res, value};
             }
@@ -408,7 +415,8 @@ namespace gc {
             ncn->bmp = cn->bmp;
             for (int i = 0; i != num; ++i) {
                 ncn->array[i] = resurrect(cn->array[i]);
-                gc::shade(ncn->array[i]);
+                //gc::shade(ncn->array[i]);
+                ncn->array[i]->maybeShade();
             }
             return toContracted(ncn, lev);
         }
@@ -436,7 +444,7 @@ namespace gc {
         const MNode* entomb(const SNode* sn) {
             TNode* tn = new TNode;
             tn->sn = sn;
-            gc::shade(sn);
+            // gc::shade(sn);
             return tn;
         }
         
@@ -461,6 +469,10 @@ namespace gc {
             context.push(main);
         }
         
+        void INode::maybeScan(ScanContext& context) const {
+            context.push(this);
+        }
+        
         std::pair<Result, const SNode*> INode::vlookupB(const INode* i, Query q, int lev, const INode* parent) const {
             const INode* sin = this;
             return ilookup(sin, q, lev + 6, i);
@@ -471,9 +483,9 @@ namespace gc {
             return iinsert(this, q, lev + 6, i);
         }
         
-        std::pair<Result, const SNode*> INode::vremoveB(const INode* i, Query q, int lev, const INode* parent,
+        std::pair<Result, const SNode*> INode::vremoveB(const INode* i, const SNode* k, int lev, const INode* parent,
                                                            const CNode* cn, std::uint64_t flag, int pos) const {
-            return iremove(this, q, lev + 6, i);
+            return iremove(this, k, lev + 6, i);
         }
         
         const BNode* INode::vresurrectA() const {
@@ -482,6 +494,10 @@ namespace gc {
         
         const MNode* INode::vtoContractedB(const CNode* cn, int lev) const {
             return cn;
+        }
+        
+        void INode::maybeShade() const {
+            gc::shade(this);
         }
         
         
@@ -501,6 +517,10 @@ namespace gc {
                    (_hash >> 6) & 63);
         }
         
+        void SNode::maybeShade() const {
+            // don't shade
+        }
+        
         void SNode::shade(ShadeContext& context) const {
             Color expected = context.WHITE();
             color.compare_exchange_strong(expected,
@@ -510,7 +530,13 @@ namespace gc {
         }
         
         void SNode::scan(ScanContext& context) const {
+            // no members
         }
+        
+        void SNode::maybeScan(ScanContext& context) const {
+            // don't scan self in via this weak interface
+        }
+        
         
         std::pair<Result, const SNode*> SNode::vlookupB(const INode* i, Query q, int lev, const INode* parent) const {
             const SNode* sn = this;
@@ -523,23 +549,35 @@ namespace gc {
         std::pair<Result, const SNode*> SNode::vinsertB(const INode* i, Query q, int lev, const INode* parent,
                                                     const CNode* cn, std::uint64_t flag, int pos) const {
             if (this->_hash == q.hash && this->view() == q.view) {
-                return {OK, this};
+                // Try to upgrade it
+                Color expected = global.white.load(RELAXED);
+                Color desired = expected ^ 2;
+                this->color.compare_exchange_strong(expected, desired, RELAXED, RELAXED);
+                if (expected != RED) {
+                    printf("Got an existing string\n");
+                    return {OK, this};
+                } else {
+                    printf("Weak pointer discovered, replacing it\n");
+                }
+                
             }
             //printf("SNode %lx,%p iinsert with lev=%d\n", this->color.load(RELAXED), this, lev);
             const SNode* nsn = new (q.view.size()) SNode(q);
             const CNode* ncn;
-            //if (this->view() != q.view) {
+            if (this->_hash != q.hash || this->view() != q.view) {
+                printf("Expanding\n");
                 const INode* nin = new INode(CNode::make(this, nsn, lev + 6));
                 ncn = cn->updated(pos, nin);
-            //} else {
-            //    ncn = cn->updated(pos, nsn);
-            //}
+            } else {
+                ncn = cn->updated(pos, nsn);
+            }
             const MNode* expected = cn;
             if (i->main.compare_exchange_strong(expected,
                                                 ncn,
                                                 RELEASE,
                                                 RELAXED)) {
-                return {OK, nullptr};
+                printf("Installed a new string\n");
+                return {OK, nsn};
             } else {
                 return {RESTART, nullptr};
             }
@@ -547,9 +585,9 @@ namespace gc {
         
         
         
-        std::pair<Result, const SNode*> SNode::vremoveB(const INode* i,Query q, int lev, const INode* parent,
+        std::pair<Result, const SNode*> SNode::vremoveB(const INode* i, const SNode* k, int lev, const INode* parent,
                                                     const CNode* cn, std::uint64_t flag, int pos) const {
-            if (this->view() != q.view)
+            if (this != k)
                 return std::pair(NOTFOUND, nullptr);
             const CNode* ncn = cn->removed(pos, flag);
             const MNode* cntr = toContracted(ncn, lev);
@@ -596,7 +634,7 @@ namespace gc {
             return {RESTART, nullptr};
         }
         
-        std::pair<Result, const SNode*> TNode::vremoveA(const INode* i, Query q, int lev, const INode* parent) const {
+        std::pair<Result, const SNode*> TNode::vremoveA(const INode* i, const SNode* k, int lev, const INode* parent) const {
             clean(parent, lev - 6);
             return {RESTART, nullptr};
         }
@@ -617,8 +655,8 @@ namespace gc {
                                                    RELAXED);
         }
         
-        void TNode::vremoveC(const INode* i, Query q, int lev, const INode* parent) const {
-            cleanParent(parent, i, q.hash, lev - 6);
+        void TNode::vremoveC(const INode* i, const SNode* k, int lev, const INode* parent) const {
+            cleanParent(parent, i, k->_hash, lev - 6);
         }
         
         
@@ -660,24 +698,63 @@ namespace gc {
                 auto [res, v2] = iinsert(r, q, 0, nullptr);
                 if (res == RESTART)
                     continue;
+                assert(v2);
                 return v2;
             }
         }
         
-        std::pair<Result, const SNode*> iremove(const INode* i, Query q, int lev, const INode* parent) {
-            return i->main.load(ACQUIRE)->vremoveA(i, q, lev, parent);
+        std::pair<Result, const SNode*> iremove(const INode* i, const SNode* k, int lev, const INode* parent) {
+            return i->main.load(ACQUIRE)->vremoveA(i, k, lev, parent);
         }
         
         const SNode* Ctrie::remove(const SNode* k) {
             for (;;) {
                 INode* r = root;
-                auto [res, v] = iremove(r, Query{k->_hash, k->view()}, 0, nullptr);
+                auto [res, v] = iremove(r, k, 0, nullptr);
                 if (res == RESTART)
                     continue;
                 return v;
             }
         }
         
+        
+        
+        
+        
+        bool SNode::sweep(SweepContext& context) {
+            Color expected = context.WHITE();
+            
+            // Race to color the object RED before a mutator colors it BLACK
+            this->color.compare_exchange_strong(expected, RED, RELAXED, RELAXED);
+            
+            if (expected == context.WHITE()) {
+                printf("Turned a string RED\n");
+                // WHITE -> RED
+                // We won the race, now race any losing mutators to remove this
+                // by identity while they attempt to replace it with a new
+                // equivalent node
+                global_string_ctrie->remove(this);
+                return false;
+            } else if (expected == context.BLACK()) {
+                printf("Preserved a BLACK string\n");
+                return false;
+            } else if (expected == RED) {
+                // Second sweep, no mutators can see us
+                printf("Deleting a RED string\n");
+
+                delete this;
+                return true;
+            } else {
+                abort();
+            }
+        }
+        
+        const SNode* SNode::make(std::string_view v) {
+            Query q;
+            q.view = v;
+            q.hash = std::hash<std::string_view>{}(v);
+            return global_string_ctrie->emplace(q);
+        }
         
         
     } // namespace _ctrie

@@ -21,6 +21,7 @@ namespace gc {
         
     using Color = std::intptr_t;
     inline constexpr Color GRAY = 1;
+    inline constexpr Color RED  = 3;
     
     using Order = std::memory_order;
     inline constexpr Order RELAXED = std::memory_order_relaxed;

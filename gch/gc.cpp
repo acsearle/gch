@@ -145,7 +145,9 @@ namespace gc {
     
     void collect() {
         
-        // TODO:
+        enter();
+        
+        // TODO: a
         //
         // is the collector thread itself a producer of allocations and holder
         // of roots?  aka, is collecting something that a (special?) mutator
@@ -156,6 +158,10 @@ namespace gc {
         // collection can be run from an entered mutator, the collector should
         // filter itself out of handshake requirements so it doesn't wait
         // for itself
+        //
+        // TODO: this is now pressing as ctrie needs to make new nodes to
+        // unlink old strings, i.e. sweep now allocates on the collector
+        // thread
         
         pthread_setname_np("C0");
                         
@@ -242,6 +248,10 @@ namespace gc {
                             adopt_infants();
                         }
                     }
+                    
+                    // handshake ourself!
+                    gc::handshake();
+                    
                     // Receive acknowledgements and recent allocations
                     while (!mutators2.empty()) {
                         Channel* channel = mutators2.back();
@@ -264,6 +274,7 @@ namespace gc {
                             delete channel;
                         }
                     }
+                                        
                     // Mutators that entered before global.mutex.unlock have
                     // been handshaked
                     
@@ -350,6 +361,7 @@ namespace gc {
                     std::size_t blacks = 0;
                     std::size_t grays = 0;
                     std::size_t whites = 0;
+                    std::size_t reds = 0;
                     LOG("scanning...");
                     for (Object* object : objects) {
                         //object->_gc_print();
@@ -370,11 +382,13 @@ namespace gc {
                             working.process();
                         } else if (expected == white) {
                             ++whites;
+                        } else if (expected == RED) {
+                            ++reds;
                         } else {
                             abort();
                         }
                     }
-                    LOG("        ...scanning found BLACK=%zu, GRAY=%zu, WHITE=%zu", blacks, grays, whites);
+                    LOG("        ...scanning found BLACK=%zu, GRAY=%zu, WHITE=%zu, RED=%zu", blacks, grays, whites, reds);
                 } while (local.dirty);
                 
                 assert(!local.dirty);
@@ -435,6 +449,8 @@ namespace gc {
                         adopt_infants();
                     }
                 }
+                // autoshake
+                gc::handshake();
                 // Receive acknowledgements and recent allocations
                 while (!mutators2.empty()) {
                     Channel* channel = mutators2.back();
@@ -581,6 +597,8 @@ namespace gc {
                     adopt_infants();
                 }
             }
+            // autoshake
+            gc::handshake();
             // Receive acknowledgements and recent allocations
             while (!mutators2.empty()) {
                 Channel* channel = mutators2.back();
@@ -650,6 +668,8 @@ namespace gc {
              */
             
         }
+        
+        leave();
         
     }
     
