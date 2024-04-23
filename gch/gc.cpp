@@ -155,26 +155,10 @@ namespace gc {
     
     void collect() {
         
-        enter();
-        
-        // TODO: a
-        //
-        // is the collector thread itself a producer of allocations and holder
-        // of roots?  aka, is collecting something that a (special?) mutator
-        // thread does (sometimes?)
-        //
-        // it seems obvious that the collector should `handshake itself` in the
-        // sense of exporting its thread-local allocations to global; and if
-        // collection can be run from an entered mutator, the collector should
-        // filter itself out of handshake requirements so it doesn't wait
-        // for itself
-        //
-        // TODO: this is now pressing as ctrie needs to make new nodes to
-        // unlink old strings, i.e. sweep now allocates on the collector
-        // thread
-        
         pthread_setname_np("C0");
-                        
+        
+        gc::enter();
+        
         size_t freed = 0;
         
         std::vector<Object*> objects;
