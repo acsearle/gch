@@ -14,184 +14,12 @@
 #include "gc.hpp"
 #include "string.hpp"
 #include "ctrie.hpp"
+#include "queue.hpp"
 
 namespace usr {
     
     using namespace gc;
 
-    template<typename T>
-    struct TrieberStack : gc::Object {
-        struct Node : gc::Object {
-            gc::Atomic<gc::StrongPtr<Node>> next;
-            T value;
-            virtual ~Node() override = default;
-            virtual void scan(gc::ScanContext& context) const override {
-                context.push(this->next);
-                context.push(this->value);
-            }
-        }; // struct Node
-        
-        gc::Atomic<gc::StrongPtr<Node>> head;
-        
-        virtual void scan(gc::ScanContext& context) const override {
-            context.push(this->head);
-        }
-        
-        void push(T value) {
-            Node* desired = new Node;
-            desired->value = std::move(value);
-            Node* expected = head.load(gc::ACQUIRE);
-            do {
-                desired->next.ptr.store(expected, gc::RELAXED);
-            } while (!head.compare_exchange_strong(expected,
-                                                   desired,
-                                                   gc::RELEASE,
-                                                   gc::ACQUIRE));
-        }
-        
-        bool pop(T& value) {
-            Node* expected = head.load(gc::ACQUIRE);
-            for (;;) {
-                if (expected == nullptr)
-                    return false;
-                Node* desired = expected->next.load(gc::RELAXED);
-                if (head.compare_exchange_strong(expected,
-                                                 desired,
-                                                 gc::RELAXED,
-                                                 gc::ACQUIRE)) {
-                    value = std::move(expected->value);
-                    return true;
-                }
-            }
-        }
-                
-    }; // TrieberStack<T>
-    
-    
-    template<typename T>
-    struct MichaelScottQueue : gc::Object {
-        
-        struct Node : gc::Object {
-            
-            gc::Atomic<gc::StrongPtr<Node>> next;
-            T value;
-            
-            virtual ~Node() override = default;
-            
-            virtual void scan(gc::ScanContext& context) const override {
-                context.push(this->next);
-                // context.push(this->value);
-            }
-            
-        }; // struct Node
-        
-        gc::Atomic<gc::StrongPtr<Node>> head;
-        gc::Atomic<gc::StrongPtr<Node>> tail;
-        
-        MichaelScottQueue() : MichaelScottQueue(new Node) {} // <-- default constructible T
-        MichaelScottQueue(const MichaelScottQueue&) = delete;
-        MichaelScottQueue(MichaelScottQueue&&) = delete;
-        virtual ~MichaelScottQueue() = default;
-        MichaelScottQueue& operator=(const MichaelScottQueue&) = delete;
-        MichaelScottQueue& operator=(MichaelScottQueue&&) = delete;
-
-        explicit MichaelScottQueue(Node* sentinel)
-        : head(sentinel)
-        , tail(sentinel) {
-        }
-        
-        virtual void scan(gc::ScanContext& context) const override {
-            context.push(this->head);
-        }
-        
-        void push(T value) {
-            // Make new node
-            Node* a = new Node;
-            assert(a);
-            a->value = std::move(value);
-
-            // Load the tail
-            Node* b = tail.load(gc::ACQUIRE);
-            for (;;) {
-                assert(b);
-                // If tail->next is null, install the new node
-                Node* next = nullptr;
-                if (b->next.compare_exchange_strong(next, a, gc::RELEASE, gc::ACQUIRE))
-                    return;
-                assert(next);
-                // tail is lagging, advance it to the next value
-                if (tail.compare_exchange_strong(b, next, gc::RELEASE, gc::ACQUIRE))
-                    b = next;
-                // Either way, b is now our last observation of tail
-            }
-        }
-        
-        bool pop(T& value) {
-            Node* expected = head.load(gc::ACQUIRE);
-            for (;;) {
-                assert(expected);
-                Node* next = expected->next.load(gc::ACQUIRE);
-                if (next == nullptr)
-                    // The queue contains only the sentinel node
-                    return false;
-                if (head.compare_exchange_strong(expected, next, gc::RELEASE, gc::ACQUIRE)) {
-                    // We moved head forward
-                    value = std::move(next->value);
-                    return true;
-                }
-                // Else we loaded an unexpected value for head, try again
-            }
-        }
-        
-    }; // MichaelScottQueue<T>
-    
-   
-    
-    struct Dictionary : gc::Object {
-        
-        mutable std::mutex mutex;
-        std::unordered_map<String*, gc::Object*, typename String::Hash, typename String::KeyEqual> map;
-        
-
-        // TODO: find must be fast
-        gc::Object* load(String* key) const {
-            std::unique_lock lock{mutex};
-            auto it = map.find(key);
-            return it != map.end() ? it->second : nullptr;
-        }
-
-        // TODO: set must be fast-ish
-        Object* exchange(String* key, Object* value) {
-            // Write barrier requires we shade the value, any old value,
-            // and any new key
-            gc::shade(value);
-            std::unique_lock lock{mutex};
-            auto it = map.find(key);
-            if (it != map.end()) {
-                gc::shade(value);
-                Object* old = it->second;
-                gc::shade(old);
-                it->second = value;
-                return old;
-            } else {
-                gc::shade(key);
-                map.emplace(key, value); // <-- O(N) resize
-                return nullptr;
-            }
-        }
-
-        // scanning can be slow but it must be authoritative
-        virtual void scan(gc::ScanContext& context) const override {
-            std::unique_lock lock{mutex};
-            for (const auto& kv : map) { // <-- O(N) iteration
-                context.push(kv.first);
-                context.push(kv.second);
-            }
-        }
-        
-    };
-    
-    
     
     
     
@@ -203,7 +31,7 @@ namespace usr {
 
     void mutate(// TrieberStack<int>* trieber_stack,
                 MichaelScottQueue<int>* michael_scott_queue,
-                Ctrie* ctrie,
+                //Ctrie* ctrie,
                 const std::size_t index,
                 std::promise<std::vector<int>> result) {
     
@@ -215,7 +43,7 @@ namespace usr {
 
         // gc::local.roots.push_back(trieber_stack);
         gc::local.roots.push_back(michael_scott_queue);
-        gc::local.roots.push_back(ctrie);
+        //gc::local.roots.push_back(ctrie);
 
         gc::enter();
                         
@@ -273,8 +101,8 @@ namespace usr {
         auto p = new MichaelScottQueue<int>; // <-- safe until we handshake or leave
         gc::local.roots.push_back(p);
         
-        auto c = new Ctrie;
-        gc::local.roots.push_back(c);
+        //auto c = new Ctrie;
+        //gc::local.roots.push_back(c);
 
         std::stack<std::future<std::vector<int>>> futures;
         std::stack<std::thread> mutators;
@@ -282,7 +110,7 @@ namespace usr {
             LOG("spawns mutator thread");
             std::promise<std::vector<int>> promise;
             futures.push(promise.get_future());
-            mutators.emplace(mutate, p, c, i, std::move(promise));
+            mutators.emplace(mutate, p, i, std::move(promise));
         }
 
         // TODO: Think about what it means to leave collectible state with
@@ -337,8 +165,7 @@ namespace usr {
     void exercise2() {
         std::thread collector{gc::collect};
         gc::enter();
-        global_string_ctrie = new Ctrie;
-        gc::global.roots.push_back(global_string_ctrie);
+        gc::_ctrie::SNode::enter();
         {
             for (int i = 0; i != 100; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds{1});

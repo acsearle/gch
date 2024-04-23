@@ -8,6 +8,7 @@
 #ifndef gc_hpp
 #define gc_hpp
 
+// for pthread_np_*name
 #include <pthread/pthread.h>
 
 #include <cstdint>
@@ -15,12 +16,16 @@
 #include <atomic>
 #include <stack>
 
-#include "queue.hpp"
+#include "deque.hpp"
 
 namespace gc {
+    
+    enum class extra_val_t : std::size_t {};
         
     using Color = std::intptr_t;
-    inline constexpr Color GRAY = 1;
+    //               Color WHITE/BLACK = 0
+    //               Color BLACK/WHITE = 1
+    inline constexpr Color GRAY = 2;
     inline constexpr Color RED  = 3;
     
     using Order = std::memory_order;
@@ -75,6 +80,9 @@ namespace gc {
         
         using Color = std::intptr_t;
         mutable std::atomic<Color> color;
+        
+        static void* operator new(std::size_t);
+        static void* operator new(std::size_t, extra_val_t);
         
         Object();
         Object(Object const&) = delete;
@@ -217,7 +225,7 @@ namespace gc {
     struct CollectionContext {
         Color _white;
         Color WHITE() const { return _white; }
-        Color BLACK() const { return _white ^ 2; }
+        Color BLACK() const { return _white ^ 1; }
     };
 
     struct ShadeContext : CollectionContext {
@@ -237,10 +245,8 @@ namespace gc {
         void push(Atomic<StrongPtr<T>> const& field) {
             push(field.load(ACQUIRE));
         }
-                
-        
 
-        std::stack<Object const*> _stack;
+        std::stack<Object const*, std::vector<Object const*>> _stack;
         
     };
     
@@ -269,10 +275,17 @@ namespace gc {
     }
     
     
+    inline void* Object::operator new(std::size_t count) {
+        return ::operator new(count);
+    }
+    
+    inline void* Object::operator new(std::size_t count, extra_val_t extra) {
+        return operator new(count + static_cast<std::size_t>(extra));
+    }
     
     inline Object::Object()
     : color(global.alloc.load(RELAXED)) {
-        assert(local.channel); // <-- catch allocations that are not inside a mutator
+        assert(local.depth); // <-- catch allocations that are not inside a mutator state
         local.allocations.push_back(this);
     }
     
@@ -466,7 +479,7 @@ namespace gc {
     
     inline void ScanContext::push(Object const* const& object) {
         Color expected = _white;
-        Color black = _white ^ 2;
+        Color black = _white ^ 1;
         if (object &&
             object->color.compare_exchange_strong(expected,
                                                   black,
@@ -478,7 +491,7 @@ namespace gc {
 
     inline void ScanContext::push(Leaf const* const& object) {
         Color expected = _white;
-        Color black = _white ^ 2;
+        Color black = _white ^ 1;
         if (object)
             object->color.compare_exchange_strong(expected,
                                                   black,

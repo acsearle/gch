@@ -43,7 +43,7 @@ namespace gc {
         : _hash(hash), _size(size) {
         }
         
-        bool invariant() {
+        bool invariant() const {
             return _hash == std::hash<std::string_view>()((std::string_view)*this);
         }
         
@@ -53,7 +53,7 @@ namespace gc {
         
         struct Hash {
             using is_transparent = void;
-            std::size_t operator()(String* const& key) const {
+            std::size_t operator()(String const* const& key) const {
                 assert(key && key->invariant());
                 return key->_hash;
             }
@@ -65,14 +65,14 @@ namespace gc {
         
         struct KeyEqual {
             using is_transparent = void;
-            bool operator()(String* const& a, String* const& b) const {
+            bool operator()(const String* a, const String* b) const {
                 assert(a && a->invariant());
                 assert(b && b->invariant());
                 assert(a->_hash == b->_hash); // <-- hash table should only be calling KeyEqual after it has checked for hash equality
                 assert((a == b) == ((std::string_view)*a == (std::string_view)*b));
                 return a == b;
             }
-            bool operator()(String* const& a, std::pair<std::string_view, std::size_t> const& b) const {
+            bool operator()(const String* a, std::pair<std::string_view, std::size_t> b) const {
                 assert(a && a->invariant());
                 assert(b.second == std::hash<std::string_view>()(b.first));
                 assert(a->_hash == b.second); // <-- hash table should only be calling KeyEqual after it has checked for hash equality

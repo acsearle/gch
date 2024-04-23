@@ -32,7 +32,7 @@ namespace gc {
             while (!_stack.empty()) {
                 Object const* object = _stack.top();
                 _stack.pop();
-                assert(object && object->color.load(RELAXED) == (_white ^ 2));
+                assert(object && object->color.load(RELAXED) == (_white ^ 1));
                 object->scan(*this);
             }
         }
@@ -182,7 +182,7 @@ namespace gc {
         
         
         Color white = global.white.load(RELAXED);
-        Color black = white xor 2;
+        Color black = white ^ 1;
 
         ScanContextPrivate working;
         working.set_white(white);
