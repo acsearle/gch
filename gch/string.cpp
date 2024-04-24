@@ -277,35 +277,29 @@ namespace gc {
         
         std::pair<Result, const SNode*> SNode::_emplace(const INode* i, Query q, int lev, const INode* parent,
                                                         const CNode* cn, std::uint64_t flag, int pos) const {
-            if (this->_hash == q.hash && this->view() == q.view) {
-                // Try to upgrade it
+            const SNode* sn = this;
+            bool equivalent = sn->_hash == q.hash && sn->view() == q.view;
+            if (equivalent) {
                 Color expected = global.white.load(RELAXED);
                 Color desired = expected ^ 1;
+                // Attempt upgrade
                 this->color.compare_exchange_strong(expected, desired, RELAXED, RELAXED);
+                assert(expected != GRAY);
                 if (expected != RED) {
-                    printf("Got an existing string\n");
                     return {OK, this};
-                } else {
-                    printf("Weak pointer discovered, replacing it\n");
                 }
-                
             }
-            //printf("SNode %lx,%p iinsert with lev=%d\n", this->color.load(RELAXED), this, lev);
+            // We must install a new node
             const SNode* nsn = new (extra_val_t{q.view.size()}) SNode(q);
-            const CNode* ncn;
-            if (this->_hash != q.hash || this->view() != q.view) {
-                printf("Expanding\n");
-                const INode* nin = new INode(CNode::make(this, nsn, lev + 6));
-                ncn = cn->updated(pos, nin);
-            } else {
-                ncn = cn->updated(pos, nsn);
-            }
+            const CNode* ncn = cn->updated(pos,
+                                           (equivalent
+                                            ? (const BNode*) nsn
+                                            : (const BNode*) new INode(CNode::make(sn, nsn, lev + 6))));
             const MNode* expected = cn;
             if (i->main.compare_exchange_strong(expected,
                                                 ncn,
                                                 RELEASE,
                                                 RELAXED)) {
-                printf("Installed a new string\n");
                 return {OK, nsn};
             } else {
                 return {RESTART, nullptr};

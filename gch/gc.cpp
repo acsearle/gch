@@ -13,8 +13,8 @@ namespace gc {
     void LOG(const char* format, ...) {
         char buffer[256];
         pthread_getname_np(pthread_self(), buffer + 240, 16);
-        char dirty = 'c' + local.dirty;
-        int n = snprintf(buffer, 240, "%s/%c: ", buffer + 240, dirty);
+        const char* dirty = local.dirty ? "dirty" : "clean";
+        int n = snprintf(buffer, 240, "%s/%s: ", buffer + 240, dirty);
         va_list args;
         va_start(args, format);
         vsnprintf(buffer + n, 256 - n, format, args);
@@ -183,9 +183,9 @@ namespace gc {
                 global.entrants.clear();
                 LOG("mutators.size() -> %zu", mutators.size());
                 LOG("objects.size() -> %zu", objects.size());
-                if (!mutators.empty() || !objects.empty())
+                if (mutators.size() > 1)
                     return;
-                LOG("collector has no work; waiting for new entrant");
+                LOG("no mutators; waiting for new entrant");
                 LOG("lifetime freed %zu", freed);
                 global.condition_variable.wait(lock);
             }

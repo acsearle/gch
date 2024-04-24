@@ -13,9 +13,50 @@
 namespace gc {
     
     namespace _ctrie {
+
+        // Todo:
         
-        template<typename Key, typename T>
+        // To support HashSet and HashMap equally we need to store an opaque
+        // thing in SNode, and access it through Hash and KeyEqual
+        
+        // To support more general-than-key lookup, we need to specify the
+        // virtual interfaces in terms of some general Query type
+        
+        // SNode doesn't actually need any table-specific members, so it's a
+        // benign overhead for any HashSet (or WeakHashSet) of Objects to just
+        // inherit from such an SNode interface and have the nodes be directly
+        // in the HashSet (so long as the Key part is immutable)
+        
+        // So, the fundamental interface could well be in terms of
+        // SNode type
+        // GetOp type -- hash and keycmp
+        // SetOp type -- hash and keycmp and emplace / assign
+        
+        // Operations --
+        // find, erase - hash and predicate
+        // erase_if - hash and extra predicate
+        // insert, insert_or_assign - hash and predicate and value_type
+        // emplace - hash and predicate and constructor args
+        //
+        // In fact, just the hash will get us to either
+        // - found an SNode* with matching hash
+        // - absent from a CNode*
+        // - found a list of LNode* with the same hash
+        
+        // And from such a handle we can do whatever
+        // LNode behavior dictates how multisets are handles
+        
+        
+        template<typename Key, typename T, typename Hash, typename KeyEqual>
         struct Ctrie : gc::Object {
+            
+            using key_type = Key;
+            using mapped_type = T;
+            using value_type = std::pair<const Key, T>;
+            using size_type = std::size_t;
+            using difference_type = std::ptrdiff_t;
+            using hasher = Hash;
+            
             
             struct ANode; // Any       : Object
             struct BNode; // Branch    : Any
@@ -26,21 +67,41 @@ namespace gc {
             struct LNode; // List      : Main
             struct TNode; // Tomb      : Main
 
-            enum Result {
+            enum Tag {
+                NOTFOUND = -1,
                 RESTART = 0,
                 OK = 1,
             };
+            
+            struct Result {
+                Tag tag;
+                union {
+                    T value;
+                };
+            };
+            
+            static Result Ok(T value) {
+                return Result{OK, value};
+            }
+            
+            static Result Restart() {
+                return Result{RESTART};
+            }
+            
+            static Result NotFound() {
+                return Result{NOTFOUND};
+            }
             
             struct ANode : Object {
                 virtual void debug(int lev) const = 0;
             };
             
             struct BNode : ANode {
-                virtual std::pair<Result, T> _find(const INode* i, Key k, int lev, const INode* parent,
+                virtual Result _find(const INode* i, Key k, int lev, const INode* parent,
                                                    const CNode* cn, std::uint64_t flag, int pos) const = 0;
-                virtual std::pair<Result, T> _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent,
+                virtual Result _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent,
                                                                const CNode* cn, std::uint64_t flag, int pos) const = 0;
-                virtual std::pair<Result, T> _erase(const INode* i, Key k, int lev, const INode* parent,
+                virtual Result _erase(const INode* i, Key k, int lev, const INode* parent,
                                                     const CNode* cn, std::uint64_t flag, int pos) const  = 0;
                 virtual const BNode* _resurrect() const = 0;
                 virtual const MNode* _contract(const CNode* parent, int lev) const = 0;
@@ -49,9 +110,9 @@ namespace gc {
             
             struct MNode : ANode {
                 
-                virtual std::pair<Result, T> _find(const INode* i, Key k, int lev, const INode* parent) const = 0;
-                virtual std::pair<Result, T> _insert_or_assign(const INode* i, Key k, T value, int lev, const INode* parent) const = 0;
-                virtual std::pair<Result, T> _erase(const INode* i, Key k, int lev, const INode* parent) const = 0;
+                virtual Result _find(const INode* i, Key k, int lev, const INode* parent) const = 0;
+                virtual Result _insert_or_assign(const INode* i, Key k, T value, int lev, const INode* parent) const = 0;
+                virtual Result _erase(const INode* i, Key k, int lev, const INode* parent) const = 0;
                 virtual void _erase2(const INode* i, Key k, int lev, const INode* parent) const {}
                 virtual const BNode* _resurrect(const INode* parent) const { return parent; }
                 virtual void vcleanA(const INode* i, int lev) const {}
@@ -73,15 +134,15 @@ namespace gc {
                 virtual void scan(ScanContext& context) const override {
                     context.push(main);
                 }
-                virtual std::pair<Result, T> _find(const INode* i, Key k, int lev, const INode* parent,
+                virtual Result _find(const INode* i, Key k, int lev, const INode* parent,
                                                    const CNode* cn, std::uint64_t flag, int pos) const override {
                     return Ctrie::_find(this, k, lev + 6, i);
                 }
-                virtual std::pair<Result, T> _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent,
+                virtual Result _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent,
                                                                const CNode* cn, std::uint64_t flag, int pos) const override {
                     return Ctrie::_insert_or_assign(this, k, v, lev + 6, i);
                 }
-                virtual std::pair<Result, T> _erase(const INode* i, Key k, int lev, const INode* parent,
+                virtual Result _erase(const INode* i, Key k, int lev, const INode* parent,
                                                     const CNode* cn, std::uint64_t flag, int pos) const override{
                     return Ctrie::_erase(this, k, lev + 6, i);
                 }
@@ -109,15 +170,15 @@ namespace gc {
                 virtual void debug(int lev) const override {
                     printf("SNode(%lx)\n", this->color.load(RELAXED));
                 }
-                virtual std::pair<Result, T> _find(const INode* i, Key k, int lev, const INode* parent,
+                virtual Result _find(const INode* i, Key k, int lev, const INode* parent,
                                                    const CNode* cn, std::uint64_t flag, int pos) const override {
                     if (this->key == k) {
-                        return {OK, value};
+                        return Ok(value);
                     } else {
-                        return {OK, nullptr};
+                        return NotFound();
                     }
                 }
-                virtual std::pair<Result, T> _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent,
+                virtual Result _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent,
                                                                const CNode* cn, std::uint64_t flag, int pos) const override {
                     const SNode* nsn = new SNode(k, v);
                     const CNode* ncn;
@@ -132,16 +193,16 @@ namespace gc {
                                                         ncn,
                                                         RELEASE,
                                                         RELAXED)) {
-                        return {OK, value};
+                        return Ok(value);
                     } else {
-                        return {RESTART, nullptr};
+                        return Restart();
                     }
                 }
                 
-                virtual std::pair<Result, T> _erase(const INode* i, Key k, int lev, const INode* parent,
+                virtual Result _erase(const INode* i, Key k, int lev, const INode* parent,
                                                     const CNode* cn, std::uint64_t flag, int pos) const override  {
                     if (this->key != k)
-                        return std::pair(OK, nullptr);
+                        return NotFound();
                     const CNode* ncn = cn->removed(pos, flag);
                     const MNode* cntr = toContracted(ncn, lev);
                     const MNode* expected = cn;
@@ -149,9 +210,9 @@ namespace gc {
                                                         cntr,
                                                         RELEASE,
                                                         RELAXED)) {
-                        return {OK, this->value};
+                        return Ok(value);
                     } else {
-                        return {RESTART, nullptr};
+                        return Restart();
                     }
                 }
                 
@@ -175,17 +236,17 @@ namespace gc {
                 virtual void scan(ScanContext& context) const override {
                     context.push(sn);
                 }
-                virtual std::pair<Result, T> _find(const INode* i, Key k, int lev, const INode* parent) const override {
+                virtual Result _find(const INode* i, Key k, int lev, const INode* parent) const override {
                     clean(parent, lev - 6);
-                    return {RESTART, nullptr};
+                    return Restart();
                 }
-                virtual std::pair<Result, T> _insert_or_assign(const INode* i, Key k, T value, int lev, const INode* parent) const override {
+                virtual Result _insert_or_assign(const INode* i, Key k, T value, int lev, const INode* parent) const override {
                     clean(parent, lev - 6);
-                    return {RESTART, nullptr};
+                    return Restart();
                 }
-                virtual std::pair<Result, T> _erase(const INode* i, Key k, int lev, const INode* parent) const override {
+                virtual Result _erase(const INode* i, Key k, int lev, const INode* parent) const override {
                     clean(parent, lev - 6);
-                    return {RESTART, nullptr};
+                    return Restart();
                 }
                 virtual void _erase2(const INode* i, Key k, int lev, const INode* parent) const override {
                     cleanParent(parent, i, k->_hash, lev - 6);
@@ -220,13 +281,13 @@ namespace gc {
                     context.push(sn);
                     context.push(next);
                 }
-                std::pair<Result, T> lookup(Key k) const {
+                Result lookup(Key k) const {
                     const LNode* ln = this;
                     for (;;) {
                         if (!ln)
-                            return {OK, nullptr};
+                            return NotFound();
                         if (ln->sn->key == k)
-                            return {OK, ln->sn->value};
+                            return Ok(ln->sn->value);
                         ln = ln->next;
                     }
                 }
@@ -304,22 +365,22 @@ namespace gc {
                     }
                 }
                 
-                virtual std::pair<Result, T> _find(const INode* i, Key k, int lev, const INode* parent) const override {
+                virtual Result _find(const INode* i, Key k, int lev, const INode* parent) const override {
                     return lookup(k);
                 }
-                virtual std::pair<Result, T> _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent) const override {
+                virtual Result _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent) const override {
                     // printf("LNode %lx,%p iinsert\n", this->color.load(RELAXED), this);
                     const MNode* expected = this;
                     if (i->main.compare_exchange_strong(expected,
                                                         inserted(k, v),
                                                         RELEASE,
                                                         RELAXED)) {
-                        return {OK, nullptr};
+                        return NotFound(); // but, success
                     } else {
-                        return {RESTART, nullptr};
+                        return Restart();
                     }
                 }
-                virtual std::pair<Result, T> _erase(const INode* i, Key k, int lev, const INode* parent) const override {
+                virtual Result _erase(const INode* i, Key k, int lev, const INode* parent) const override {
                     const LNode* ln = this;
                     auto [nln, v] = ln->removed(k);
                     assert(nln && nln->sn);
@@ -329,9 +390,9 @@ namespace gc {
                                                         desired,
                                                         RELEASE,
                                                         RELAXED)) {
-                        return {OK, v};
+                        return Ok(v);
                     } else {
-                        return {RESTART, nullptr};
+                        return Restart();
                     }
                 }
             }; // struct LNode
@@ -458,7 +519,7 @@ namespace gc {
                     return b;
                 }
                 
-                virtual std::pair<Result, T> _find(const INode* i, Key k, int lev, const INode* parent) const override {
+                virtual Result _find(const INode* i, Key k, int lev, const INode* parent) const override {
                     const CNode* cn = this;
                     auto [flag, pos] = flagpos(k->_hash, lev, cn->bmp);
                     if (!(flag & cn->bmp)) {
@@ -468,7 +529,7 @@ namespace gc {
                     }
                 }
                 
-                virtual std::pair<Result, T> _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent) const override {
+                virtual Result _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent) const override {
                     const CNode* cn = this;
                     auto [flag, pos] = flagpos(k->_hash, lev, cn->bmp);
                     if (!(flag & cn->bmp)) {
@@ -476,27 +537,27 @@ namespace gc {
                         const SNode* sn =  new SNode(k, v);
                         const MNode* desired = inserted(flag, pos, sn);
                         if (i->main.compare_exchange_strong(expected, desired, RELEASE, RELAXED)) {
-                            return {OK, sn->value};
+                            return Ok(sn->value);
                         } else {
-                            return {RESTART, nullptr};
+                            return Restart();
                         }
                     } else {
                         return array[pos]->_insert_or_assign(i, k, v, lev, parent, cn, flag, pos);
                     }
                 }
                 
-                virtual std::pair<Result, T> _erase(const INode* i, Key k, int lev, const INode* parent) const override {
+                virtual Result _erase(const INode* i, Key k, int lev, const INode* parent) const override {
                     auto [flag, pos] = flagpos(k->_hash, lev, bmp);
                     if (!(flag & bmp)) {
-                        return {OK, nullptr};
+                        return NotFound();
                     }
                     const BNode* sub = array[pos];
                     assert(sub);
-                    auto [res, value] = sub->_erase(i, k, lev, parent, this, flag, pos);
-                    if (res == OK) {
+                    Result result = sub->_erase(i, k, lev, parent, this, flag, pos);
+                    if (result.tag == OK) {
                         i->main.load(ACQUIRE)->_erase2(i, k, lev, parent);
                     }
-                    return {res, value};
+                    return result;
                 }
                 
                 virtual void vcleanA(const INode* i, int lev) const override {
@@ -564,15 +625,15 @@ namespace gc {
                 return tn;
             }
 
-            static std::pair<Result, T> _find(const INode* i, Key k, int lev, const INode* parent) {
+            static Result _find(const INode* i, Key k, int lev, const INode* parent) {
                 return i->main.load(ACQUIRE)->_find(i, k, lev, parent);
             }
 
-            static std::pair<Result, T> _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent) {
+            static Result _insert_or_assign(const INode* i, Key k, T v, int lev, const INode* parent) {
                 return i->main.load(ACQUIRE)->_insert_or_assign(i, k, v, lev, parent);
             }
             
-            static std::pair<Result, T> _erase(const INode* i, Key k, int lev, const INode* parent) {
+            static Result _erase(const INode* i, Key k, int lev, const INode* parent) {
                 return i->main.load(ACQUIRE)->_erase(i, k, lev, parent);
             }
                         
@@ -591,31 +652,30 @@ namespace gc {
             T find(Key k) {
                 for (;;) {
                     INode* r = root;
-                    auto [res, v] = _find(r, k, 0, nullptr);
-                    if (res == RESTART)
+                    Result result = _find(r, k, 0, nullptr);
+                    if (result.tag == RESTART)
                         continue;
-                    return v;
+                    return result.value;
                 }
             }
             
             T insert_or_assign(Key k, T v) {
                 for (;;) {
                     INode* r = root;
-                    auto [res, v2] = _insert_or_assign(r, k, v, 0, nullptr);
-                    if (res == RESTART)
+                    Result result = _insert_or_assign(r, k, v, 0, nullptr);
+                    if (result.tag == RESTART)
                         continue;
-                    assert(v2);
-                    return v2;
+                    return result.value;
                 }
             }
             
             T erase(Key k) {
                 for (;;) {
                     INode* r = root;
-                    auto [res, v] = _erase(r, k, 0, nullptr);
-                    if (res == RESTART)
+                    Result result = _erase(r, k, 0, nullptr);
+                    if (result.tag == RESTART)
                         continue;
-                    return v;
+                    return result.value;
                 }
             }
                         

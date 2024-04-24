@@ -24,15 +24,6 @@ namespace usr {
         
     void exercise() {
         
-        gc::enter();
-        
-        gc::String::enter();
-
-        LOG("creates a concurrent stack");
-        
-        LOG("spawns collector thread");
-        std::thread collector{gc::collect};
-
         auto* a = new gc::_ctrie::Ctrie<const String*, const String*>;
         global.roots.push_back(a);
         
@@ -40,7 +31,7 @@ namespace usr {
         for (std::size_t i = 0; i != THREADS; ++i) {
             LOG("spawns mutator thread");
             mutators.emplace([=](){
-                char name[3] = "M0";
+                char name[3] = "M1";
                 name[1] += i;
                 pthread_setname_np(name);
                 gc::enter();
@@ -74,26 +65,27 @@ namespace usr {
                 gc::leave();
             });
         }
-                                
+        
         gc::leave();
-
+        
         while (!mutators.empty()) {
             mutators.top().join();
             LOG("joined a mutator thread");
             mutators.pop();
         }
-        
-        collector.join();
-        LOG("joined the collector thread");
-                
     }
-    
-    
 }
 
 int main(int argc, const char * argv[]) {
-    pthread_setname_np("MAIN");
+    pthread_setname_np("M0");
+    gc::enter();
+    gc::String::enter();
+    gc::LOG("spawns collector thread");
+    std::thread collector{gc::collect};
     usr::exercise();
+    collector.join();
+    gc::LOG("joined the collector thread");
+    gc::leave();
 }
 
 
